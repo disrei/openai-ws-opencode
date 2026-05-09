@@ -4,19 +4,24 @@ import type { TransportContext } from "./headers.js"
 
 function abortPending(conn: PooledConnection, error: Error) {
   const pending = conn.pending
-  if (!pending || pending.done) return
-  pending.done = true
-  if (conn.ws?.readyState === 1) {
+  if (pending && !pending.done && conn.ws?.readyState === 1) {
     try {
       conn.ws.send(JSON.stringify({ type: "response.cancel" }))
     } catch {}
   }
-  try {
-    pending.controller.error(error)
-  } catch {}
+  if (pending && !pending.done) {
+    pending.done = true
+    try {
+      pending.controller.error(error)
+    } catch {}
+  }
   conn.pending = null
   conn.busy = false
   closeConnections((candidate) => candidate === conn, "Client aborted")
+}
+
+function abortError(signal?: AbortSignal): Error {
+  return signal?.reason instanceof Error ? signal.reason : new DOMException("Aborted", "AbortError")
 }
 
 export function bridgeWebSocket(
@@ -27,25 +32,42 @@ export function bridgeWebSocket(
   context: TransportContext = {},
   signal?: AbortSignal,
 ): Response {
-  const wsBody = prepareBody(requestBody, isOAuth)
+  const wsBody = prepareBody(requestBody, isOAuth, context)
+  const acquisitionController = new AbortController()
   let conn: PooledConnection | undefined
   let finalized = false
+  let streamController: ReadableStreamDefaultController<Uint8Array> | undefined
 
   const cleanupAbort = () => {
     if (signal) signal.removeEventListener("abort", onAbort)
+  }
+
+  const finalize = () => {
+    finalized = true
+    cleanupAbort()
+    acquisitionController.abort(new DOMException("Stream finalized", "AbortError"))
+  }
+
+  const settleQueued = (error: Error) => {
+    try {
+      streamController?.error(error)
+    } catch {}
   }
 
   const onAbort = () => {
     if (finalized) return
     finalized = true
     cleanupAbort()
-    if (conn) abortPending(conn, signal?.reason instanceof Error ? signal.reason : new DOMException("Aborted", "AbortError"))
+    const error = abortError(signal)
+    acquisitionController.abort(error)
+    if (conn) abortPending(conn, error)
+    else settleQueued(error)
   }
 
   const startStream = (controller: ReadableStreamDefaultController<Uint8Array>, acquired: PooledConnection) => {
     conn = acquired
     if (finalized || signal?.aborted) {
-      abortPending(conn, signal?.reason instanceof Error ? signal.reason : new DOMException("Aborted", "AbortError"))
+      abortPending(conn, abortError(signal))
       return
     }
     conn.activeSessionID = context.sessionID
@@ -55,11 +77,11 @@ export function bridgeWebSocket(
     conn.pending = {
       body: wsBody,
       controller,
+      onFinalize: finalize,
       done: false,
       sent: false,
-      forwarded: false,
-      replayUnsafeForwarded: false,
-      frameCount: 0,
+      processedAckSent: false,
+      idleTimer: null,
       metadata: {},
     }
     sendPending(conn)
@@ -67,14 +89,17 @@ export function bridgeWebSocket(
 
   const readable = new ReadableStream<Uint8Array>({
     start(controller) {
+      streamController = controller
       if (signal?.aborted) {
-        controller.error(signal.reason instanceof Error ? signal.reason : new DOMException("Aborted", "AbortError"))
+        finalized = true
+        controller.error(abortError(signal))
         return
       }
       if (signal) signal.addEventListener("abort", onAbort, { once: true })
-      const acquired = acquireConnection(wsUrl, headers, context, signal)
+      const acquired = acquireConnection(wsUrl, headers, context, acquisitionController.signal)
       if (acquired instanceof Promise) {
         acquired.then((next) => startStream(controller, next)).catch((error) => {
+          if (finalized) return
           finalized = true
           cleanupAbort()
           controller.error(error instanceof Error ? error : new Error(String(error)))
@@ -87,7 +112,9 @@ export function bridgeWebSocket(
       if (finalized) return
       finalized = true
       cleanupAbort()
+      acquisitionController.abort(new DOMException("Aborted", "AbortError"))
       if (conn) abortPending(conn, new DOMException("Aborted", "AbortError"))
+      else settleQueued(new DOMException("Aborted", "AbortError"))
     },
   })
 

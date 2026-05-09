@@ -10,5 +10,6 @@ export {
   setWebSocketConstructorForTesting,
 } from "./transport/pool.js"
 export { bridgeWebSocket } from "./transport/bridge.js"
-export { resolveModels, resolveModelsBestEffort, resolveModelsFromCatalog, providerConfig } from "./models/resolve.js"
+export { fetchCodexCatalog, fetchOpenAIModelIds, resetCatalogCacheForTesting } from "./models/catalog.js"
+export { resolveModels, resolveModelsForApiKey, resolveModelsForOAuth, providerConfig } from "./models/resolve.js"
 export { transportConfig } from "./transport/config.js"

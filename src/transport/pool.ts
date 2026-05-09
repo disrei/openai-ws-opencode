@@ -1,42 +1,33 @@
 import crypto from "node:crypto"
-import WebSocket from "ws"
+import {
+  OPENAI_MODEL_HEADER,
+  OPENAI_WS_INSTALLATION_ID_ENV,
+  RESPONSE_PROCESSED_ENV,
+  X_CODEX_INSTALLATION_ID_HEADER,
+  X_CODEX_TURN_STATE_HEADER,
+  X_CODEX_WINDOW_ID_HEADER,
+  X_MODELS_ETAG_HEADER,
+  X_OPENAI_SUBAGENT_HEADER,
+  X_REASONING_INCLUDED_HEADER,
+} from "../constants.js"
+import { loadDefaultWebSocketConstructor, type WebSocketConstructor, type WebSocketLike } from "./bun-websocket.js"
 import { transportConfig } from "./config.js"
 import type { TransportContext } from "./headers.js"
 
-type WebSocketLike = {
-  readyState: number
-  send(data: string): void
-  close(code?: number, reason?: string): void
-  terminate?: () => void
-  ping?: () => void
-  on?(event: string, listener: (...args: any[]) => void): unknown
-  off?(event: string, listener: (...args: any[]) => void): unknown
-  addEventListener?(event: string, listener: (...args: any[]) => void): unknown
-  removeEventListener?(event: string, listener: (...args: any[]) => void): unknown
-}
-
-type WebSocketConstructor = new (url: string, options: { headers: Record<string, string> }) => WebSocketLike
-
-let WebSocketImpl: WebSocketConstructor = WebSocket as unknown as WebSocketConstructor
+let WebSocketImpl: WebSocketConstructor = loadDefaultWebSocketConstructor()
 
 type PendingMetadata = {
   responseId?: string
-  model?: string
-  createdAt?: number
-  serviceTier?: unknown
-  usage?: unknown
 }
 
 export interface PendingRequest {
   body: Record<string, unknown>
   controller: ReadableStreamDefaultController<Uint8Array>
+  onFinalize?: () => void
   done: boolean
   sent: boolean
-  forwarded: boolean
-  replayUnsafeForwarded: boolean
-  frameCount: number
-  lastEventType?: string
-  lastSequenceNumber?: number
+  processedAckSent: boolean
+  idleTimer: ReturnType<typeof setTimeout> | null
   metadata: PendingMetadata
 }
 
@@ -47,6 +38,7 @@ export interface PooledConnection {
   headers: Record<string, string>
   scopeKey: string
   scopeHash: string
+  contextKey: string
   busy: boolean
   warm: boolean
   pending: PendingRequest | null
@@ -57,6 +49,10 @@ export interface PooledConnection {
   lastModelID?: string
   lastStablePrefixHash?: string
   lastResponseID?: string
+  turnState?: string
+  serverModel?: string
+  modelsEtag?: string
+  serverReasoningIncluded?: boolean
   generation: number
   reconnectAttempts: number
   createdAt: number
@@ -85,6 +81,8 @@ type QueueEntry = {
 }
 
 const acquisitionQueues = new Map<string, QueueEntry[]>()
+const turnStateByContext = new Map<string, string>()
+const lastResponseIDByContext = new Map<string, string>()
 let nextConnectionID = 1
 
 export const readyState = {
@@ -117,6 +115,46 @@ function scopeKey(wsUrl: string, headers: Record<string, string>): string {
   return `${wsUrl}::${authScopeHash(headers)}`
 }
 
+function contextScopeKey(wsUrl: string, headers: Record<string, string>, context: TransportContext): string {
+  return `${scopeKey(wsUrl, headers)}::session:${context.sessionID ?? ""}::agent:${context.agent ?? ""}`
+}
+
+function headersForConnection(
+  wsUrl: string,
+  baseHeaders: Record<string, string>,
+  context: TransportContext,
+  key: string,
+): Record<string, string> {
+  const headers = { ...baseHeaders }
+  if (context.sessionID) {
+    headers.session_id = context.sessionID
+    headers["session-id"] = context.sessionID
+    headers.thread_id = context.sessionID
+    headers["thread-id"] = context.sessionID
+    headers["x-client-request-id"] = crypto.createHash("sha256").update(`${wsUrl}:${context.sessionID}`).digest("hex").slice(0, 32)
+    headers[X_CODEX_WINDOW_ID_HEADER] = context.sessionID
+  }
+  if (context.agent && context.agent !== "primary") headers[X_OPENAI_SUBAGENT_HEADER] = context.agent
+  const installationID = process.env[OPENAI_WS_INSTALLATION_ID_ENV]
+  if (installationID) headers[X_CODEX_INSTALLATION_ID_HEADER] = installationID
+  const turnState = turnStateByContext.get(key)
+  if (turnState) headers[X_CODEX_TURN_STATE_HEADER] = turnState
+  return headers
+}
+
+function headerValue(source: unknown, name: string): string | undefined {
+  const headers = (source as { headers?: unknown } | undefined)?.headers
+  if (!headers) return undefined
+  if (headers instanceof Headers) return headers.get(name) ?? undefined
+  if (typeof (headers as { get?: unknown }).get === "function") {
+    const value = (headers as { get: (key: string) => unknown }).get(name)
+    return Array.isArray(value) ? String(value[0]) : value === undefined || value === null ? undefined : String(value)
+  }
+  const record = headers as Record<string, unknown>
+  const value = record[name] ?? record[name.toLowerCase()]
+  return Array.isArray(value) ? String(value[0]) : value === undefined || value === null ? undefined : String(value)
+}
+
 function clearTimer(timer: ReturnType<typeof setTimeout> | null) {
   if (timer) clearTimeout(timer)
 }
@@ -133,6 +171,19 @@ function clearHeartbeat(conn: PooledConnection) {
   clearTimer(conn.pongTimer)
   conn.heartbeatTimer = null
   conn.pongTimer = null
+}
+
+function clearPendingTimer(pending: PendingRequest | null | undefined) {
+  if (!pending) return
+  clearTimer(pending.idleTimer)
+  pending.idleTimer = null
+}
+
+function finalizePending(pending: PendingRequest | null | undefined) {
+  if (!pending) return
+  clearPendingTimer(pending)
+  pending.onFinalize?.()
+  pending.onFinalize = undefined
 }
 
 function detach(conn: PooledConnection) {
@@ -172,15 +223,17 @@ function closeSocket(conn: PooledConnection, code: number, reason: string) {
   } catch {}
 }
 
-function finishConnection(conn: PooledConnection) {
-  conn.pending = null
-  conn.activeSessionID = undefined
-  conn.activeAgent = undefined
-  conn.busy = false
-  drainQueue(conn.scopeKey)
-}
-
 function terminalRelease(conn: PooledConnection) {
+  if (conn.turnState) {
+    finalizePending(conn.pending)
+    conn.pending = null
+    conn.activeSessionID = undefined
+    conn.activeAgent = undefined
+    conn.busy = false
+    removeAndDrain(conn)
+    closeSocket(conn, 1000, "turn complete")
+    return
+  }
   release(conn)
   drainQueue(conn.scopeKey)
 }
@@ -188,22 +241,6 @@ function terminalRelease(conn: PooledConnection) {
 function removeAndDrain(conn: PooledConnection) {
   remove(conn)
   drainQueue(conn.scopeKey)
-}
-
-function transportDiagnostics(conn: PooledConnection, pending?: PendingRequest) {
-  return {
-    message: "WebSocket closed before response completed",
-    connectionId: conn.id,
-    scopeHash: conn.scopeHash.slice(0, 12),
-    sessionId: conn.activeSessionID,
-    agent: conn.activeAgent,
-    reconnectAttempts: conn.reconnectAttempts,
-    closeCode: conn.lastCloseCode ?? null,
-    closeReason: conn.lastCloseReason ?? "",
-    lastError: conn.lastErrorMessage ?? null,
-    frameCount: pending?.frameCount ?? 0,
-    lastEventType: pending?.lastEventType,
-  }
 }
 
 function scheduleHeartbeat(conn: PooledConnection) {
@@ -239,6 +276,7 @@ function scheduleHeartbeat(conn: PooledConnection) {
 function release(conn: PooledConnection) {
   conn.lastSessionID = conn.activeSessionID
   conn.lastAgent = conn.activeAgent
+  finalizePending(conn.pending)
   conn.pending = null
   conn.activeSessionID = undefined
   conn.activeAgent = undefined
@@ -277,6 +315,7 @@ function fail(conn: PooledConnection, error: Error, shouldCloseSocket: boolean) 
   const pending = conn.pending
   if (pending && !pending.done) {
     pending.done = true
+    finalizePending(pending)
     try {
       pending.controller.error(error)
     } catch {}
@@ -294,75 +333,34 @@ function fail(conn: PooledConnection, error: Error, shouldCloseSocket: boolean) 
 }
 
 function cacheResponseMetadata(pending: PendingRequest, frame: Record<string, unknown>) {
-  const sequenceNumber = frame.sequence_number
-  if (typeof sequenceNumber === "number") pending.lastSequenceNumber = sequenceNumber
   const response = frame.response
   if (response && typeof response === "object") {
     const value = response as Record<string, unknown>
     if (typeof value.id === "string") pending.metadata.responseId = value.id
-    if (typeof value.model === "string") pending.metadata.model = value.model
-    if (typeof value.created_at === "number") pending.metadata.createdAt = value.created_at
-    if ("service_tier" in value) pending.metadata.serviceTier = value.service_tier
-    if ("usage" in value) pending.metadata.usage = value.usage
   }
   if (typeof frame.response_id === "string") pending.metadata.responseId = frame.response_id
 }
 
-function isReplayUnsafeFrame(frame: Record<string, unknown>): boolean {
-  const eventType = typeof frame.type === "string" ? frame.type : "message"
-  if (["response.created", "response.in_progress"].includes(eventType)) return false
-  if (["response.completed", "response.failed", "response.incomplete", "error"].includes(eventType)) return true
-  if (eventType.includes(".delta")) return true
-  if (eventType.includes("output_item") || eventType.includes("content_part")) return true
-  if (eventType.includes("function_call") || eventType.includes("tool")) return true
-  if (eventType.includes("reasoning") || eventType.includes("annotation")) return true
-  return eventType !== "message" || Object.keys(frame).some((key) => ["delta", "output", "item", "content", "arguments"].includes(key))
+function isTerminalEvent(eventType: string): boolean {
+  return ["response.completed", "response.failed", "response.incomplete"].includes(eventType)
 }
 
-function fallbackUsage() {
-  return {
-    input_tokens: 0,
-    output_tokens: 0,
-    total_tokens: 0,
-    input_tokens_details: { cached_tokens: 0 },
-    output_tokens_details: { reasoning_tokens: 0 },
-  }
-}
-
-function syntheticIncompleteFrame(conn: PooledConnection, pending: PendingRequest): Record<string, unknown> {
-  const metadata = pending.metadata
-  return {
-    type: "response.incomplete",
-    ...(pending.lastSequenceNumber !== undefined ? { sequence_number: pending.lastSequenceNumber + 1 } : {}),
-    response: {
-      id: metadata.responseId ?? "resp_unknown",
-      object: "response",
-      status: "incomplete",
-      ...(metadata.model ? { model: metadata.model } : {}),
-      ...(metadata.createdAt !== undefined ? { created_at: metadata.createdAt } : {}),
-      incomplete_details: { reason: "transport_error" },
-      usage: metadata.usage ?? fallbackUsage(),
-      service_tier: metadata.serviceTier ?? null,
-    },
-    openai_ws_transport_error: transportDiagnostics(conn, pending),
-  }
-}
-
-function synthesizeIncomplete(conn: PooledConnection) {
+function schedulePendingIdleTimeout(conn: PooledConnection, reason: string) {
   const pending = conn.pending
   if (!pending || pending.done) return
-  const frame = syntheticIncompleteFrame(conn, pending)
-  const encoded = new TextEncoder().encode(`event: response.incomplete\ndata: ${JSON.stringify(frame)}\n\n`)
-  try {
-    pending.controller.enqueue(encoded)
-  } catch {}
-  pending.done = true
-  try {
-    pending.controller.close()
-  } catch {}
-  finishConnection(conn)
-  removeAndDrain(conn)
-  closeSocket(conn, 1000, "transport incomplete")
+  clearPendingTimer(pending)
+  const generation = conn.generation
+  pending.idleTimer = unrefTimer(
+    setTimeout(() => {
+      if (generation !== conn.generation) return
+      const current = conn.pending
+      if (!current || current !== pending || current.done) return
+      current.idleTimer = null
+      conn.lastCloseCode = 1006
+      conn.lastCloseReason = "response idle timeout"
+      fail(conn, new Error(formatFailureMessage(conn, `response idle timeout after ${reason}`)), true)
+    }, transportConfig.responseIdleTimeoutMs),
+  )
 }
 
 function parseFrames(data: unknown): Array<Record<string, unknown>> {
@@ -382,27 +380,71 @@ function parseFrames(data: unknown): Array<Record<string, unknown>> {
   return frames
 }
 
+function numberFrom(value: unknown): number | undefined {
+  if (typeof value === "number") return value
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return undefined
+}
+
+function wrappedWebSocketError(frame: Record<string, unknown>): Error | undefined {
+  if (frame.type !== "error") return undefined
+  const error = frame.error && typeof frame.error === "object" ? (frame.error as Record<string, unknown>) : {}
+  const code = typeof error.code === "string" ? error.code : typeof frame.code === "string" ? frame.code : undefined
+  const message =
+    typeof error.message === "string" ? error.message : typeof frame.message === "string" ? frame.message : code
+  if (code === "websocket_connection_limit_reached") {
+    return new Error(message ?? "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue.")
+  }
+  const status = numberFrom(frame.status) ?? numberFrom(frame.status_code) ?? numberFrom(error.status) ?? numberFrom(error.status_code)
+  if (status !== undefined && status >= 200 && status < 300) return undefined
+  return new Error(
+    `OpenAI WebSocket error${status !== undefined ? ` ${status}` : ""}${code ? ` ${code}` : ""}${message ? `: ${message}` : ""}`,
+  )
+}
+
+function sendResponseProcessed(conn: PooledConnection, pending: PendingRequest, eventType: string) {
+  if (eventType !== "response.completed") return
+  if (process.env[RESPONSE_PROCESSED_ENV] !== "1") return
+  if (pending.processedAckSent || !pending.metadata.responseId) return
+  try {
+    conn.ws?.send(JSON.stringify({ type: "response.processed", response_id: pending.metadata.responseId }))
+    pending.processedAckSent = true
+  } catch (error) {
+    conn.lastErrorMessage = error instanceof Error ? error.message : String(error)
+  }
+}
+
 function enqueueSSE(conn: PooledConnection, frame: Record<string, unknown>) {
   const pending = conn.pending
   if (!pending || pending.done) return
   const eventType = typeof frame.type === "string" ? frame.type : "message"
   cacheResponseMetadata(pending, frame)
+  const mappedError = wrappedWebSocketError(frame)
+  if (mappedError) {
+    fail(conn, mappedError, true)
+    return
+  }
   const encoded = new TextEncoder().encode(`event: ${eventType}\ndata: ${JSON.stringify(frame)}\n\n`)
   try {
     pending.controller.enqueue(encoded)
   } catch {
     return
   }
-  pending.forwarded = true
-  pending.frameCount++
-  pending.lastEventType = eventType
-  if (isReplayUnsafeFrame(frame)) pending.replayUnsafeForwarded = true
-  if (["response.completed", "response.failed", "response.incomplete", "error"].includes(eventType)) {
+  if (!isTerminalEvent(eventType)) schedulePendingIdleTimeout(conn, eventType)
+  if (isTerminalEvent(eventType)) {
+    finalizePending(pending)
     pending.done = true
+    sendResponseProcessed(conn, pending, eventType)
     try {
       pending.controller.close()
     } catch {}
-    if (pending.metadata.responseId) conn.lastResponseID = pending.metadata.responseId
+    if (pending.metadata.responseId) {
+      conn.lastResponseID = pending.metadata.responseId
+      lastResponseIDByContext.set(conn.contextKey, pending.metadata.responseId)
+    }
     terminalRelease(conn)
   }
 }
@@ -413,13 +455,16 @@ export function sendPending(conn: PooledConnection): boolean {
   const ws = conn.ws
   if (!ws || ws.readyState !== readyState.OPEN) return false
   try {
-    ws.send(JSON.stringify({ type: "response.create", ...pending.body }))
+    const body = { ...pending.body }
+    if (body.previous_response_id === undefined && conn.lastResponseID) body.previous_response_id = conn.lastResponseID
+    ws.send(JSON.stringify({ ...body, type: "response.create" }))
   } catch (error) {
     conn.lastErrorMessage = error instanceof Error ? error.message : String(error)
     queueMicrotask(() => handleSocketLoss(conn))
     return false
   }
   pending.sent = true
+  schedulePendingIdleTimeout(conn, "response.create")
   return true
 }
 
@@ -433,14 +478,12 @@ function normalizeCloseReason(reason: unknown): string | undefined {
 
 function connect(conn: PooledConnection) {
   clearHeartbeat(conn)
-  const ws = new WebSocketImpl(conn.wsUrl, { headers: conn.headers })
   const generation = ++conn.generation
-  conn.ws = ws
   clearTimer(conn.retryTimer)
   conn.retryTimer = null
   clearTimer(conn.connectTimer)
   const connectTimer = setTimeout(() => {
-    if (generation !== conn.generation || ws.readyState === readyState.OPEN) return
+    if (generation !== conn.generation || conn.ws?.readyState === readyState.OPEN) return
     conn.lastCloseCode = 1006
     conn.lastCloseReason = "connection timed out"
     handleSocketLoss(conn)
@@ -456,9 +499,25 @@ function connect(conn: PooledConnection) {
     sendPending(conn)
   }
 
-  const handleMessage = (data: unknown) => {
+  const handleUpgrade = (response: unknown) => {
+    if (generation !== conn.generation) return
+    const turnState = headerValue(response, X_CODEX_TURN_STATE_HEADER)
+    if (turnState) {
+      conn.turnState = turnState
+      turnStateByContext.set(conn.contextKey, turnState)
+    }
+    conn.serverReasoningIncluded = headerValue(response, X_REASONING_INCLUDED_HEADER) !== undefined
+    conn.modelsEtag = headerValue(response, X_MODELS_ETAG_HEADER)
+    conn.serverModel = headerValue(response, OPENAI_MODEL_HEADER)
+  }
+
+  const handleMessage = (data: unknown, isBinary?: boolean) => {
     if (generation !== conn.generation) return
     conn.lastActivityAt = Date.now()
+    if (isBinary) {
+      fail(conn, new Error("unexpected binary websocket event"), true)
+      return
+    }
     for (const frame of parseFrames(data)) enqueueSSE(conn, frame)
   }
 
@@ -485,7 +544,17 @@ function connect(conn: PooledConnection) {
     handleSocketLoss(conn)
   }
 
+  const ws = new WebSocketImpl(conn.wsUrl, {
+    headers: conn.headers,
+    perMessageDeflate: true,
+    finishRequest(request) {
+      request.on?.("upgrade", handleUpgrade)
+      request.end?.()
+    },
+  })
+  conn.ws = ws
   on(ws, "open", handleOpen)
+  on(ws, "upgrade", handleUpgrade)
   on(ws, "message", handleMessage)
   on(ws, "pong", handlePong)
   on(ws, "error", handleError)
@@ -493,11 +562,13 @@ function connect(conn: PooledConnection) {
 
   conn.detach = () => {
     off(ws, "open", handleOpen)
+    off(ws, "upgrade", handleUpgrade)
     off(ws, "message", handleMessage)
     off(ws, "pong", handlePong)
     off(ws, "error", handleError)
     off(ws, "close", handleClose)
   }
+  if (ws.readyState === readyState.OPEN) queueMicrotask(handleOpen)
 }
 
 function handleSocketLoss(conn: PooledConnection) {
@@ -506,18 +577,18 @@ function handleSocketLoss(conn: PooledConnection) {
   clearHeartbeat(conn)
   const pending = conn.pending
   if (!pending || pending.done) {
+    finalizePending(pending)
     removeAndDrain(conn)
     closeSocket(conn, 1000, "socket lost")
     return
   }
-  if (pending.replayUnsafeForwarded) {
-    synthesizeIncomplete(conn)
+  if (pending.sent) {
+    fail(conn, new Error(formatFailureMessage(conn, "response.create was already sent")), true)
     return
   }
   const canRetry = conn.reconnectAttempts < transportConfig.maxReconnectAttempts
   if (canRetry) {
     conn.reconnectAttempts++
-    pending.sent = false
     const priorWs = conn.ws
     detach(conn)
     try {
@@ -530,30 +601,30 @@ function handleSocketLoss(conn: PooledConnection) {
     conn.retryTimer = unrefTimer(
       setTimeout(() => {
         conn.retryTimer = null
-        if (!connectionPool.includes(conn) || !conn.pending || conn.pending.done || conn.pending.replayUnsafeForwarded) return
+        if (!connectionPool.includes(conn) || !conn.pending || conn.pending.done || conn.pending.sent) return
         connect(conn)
       }, retryDelay(conn.reconnectAttempts)),
     )
     return
   }
-  const reason = pending.forwarded
-    ? "retry limit reached after replay-safe frames only"
-    : "retry limit reached before any frame was forwarded"
-  fail(conn, new Error(formatFailureMessage(conn, reason)), true)
+  fail(conn, new Error(formatFailureMessage(conn, "retry limit reached before response.create was sent")), true)
 }
 
-function create(wsUrl: string, headers: Record<string, string>, warm = false): PooledConnection {
+function create(wsUrl: string, headers: Record<string, string>, context: TransportContext = {}, warm = false): PooledConnection {
   const hash = authScopeHash(headers)
+  const key = contextScopeKey(wsUrl, headers, context)
   const conn: PooledConnection = {
     id: `ws-${nextConnectionID++}`,
     ws: null,
     wsUrl,
-    headers,
-    scopeKey: `${wsUrl}::${hash}`,
+    headers: headersForConnection(wsUrl, headers, context, key),
+    scopeKey: key,
     scopeHash: hash,
+    contextKey: key,
     busy: false,
     warm,
     pending: null,
+    lastResponseID: lastResponseIDByContext.get(key),
     generation: 0,
     reconnectAttempts: 0,
     createdAt: Date.now(),
@@ -602,7 +673,7 @@ function cleanupStaleConnections(key: string, now: number) {
 }
 
 function reserveConnection(wsUrl: string, headers: Record<string, string>, context: TransportContext): PooledConnection | null {
-  const key = scopeKey(wsUrl, headers)
+  const key = contextScopeKey(wsUrl, headers, context)
   const now = Date.now()
   cleanupStaleConnections(key, now)
   const reusable = connectionPool.find((conn) => isReusable(conn, key, context, now))
@@ -615,7 +686,7 @@ function reserveConnection(wsUrl: string, headers: Record<string, string>, conte
     return reusable
   }
   if (activeCount(key) >= transportConfig.maxConnectionsPerScope) return null
-  const conn = create(wsUrl, headers)
+  const conn = create(wsUrl, headers, context)
   conn.busy = true
   return conn
 }
@@ -626,7 +697,7 @@ function queueAcquire(
   context: TransportContext,
   signal?: AbortSignal,
 ): Promise<PooledConnection> {
-  const key = scopeKey(wsUrl, headers)
+  const key = contextScopeKey(wsUrl, headers, context)
   return new Promise((resolve, reject) => {
     const entry: QueueEntry = {
       wsUrl,
@@ -687,7 +758,7 @@ export function acquireConnection(
 }
 
 export function ensureWarmConnection(wsUrl: string, headers: Record<string, string>) {
-  const key = scopeKey(wsUrl, headers)
+  const key = contextScopeKey(wsUrl, headers, {})
   const now = Date.now()
   cleanupStaleConnections(key, now)
   const existing = connectionPool.find((conn) => conn.scopeKey === key && !conn.busy && conn.ws?.readyState === readyState.OPEN)
@@ -699,7 +770,7 @@ export function ensureWarmConnection(wsUrl: string, headers: Record<string, stri
     return existing
   }
   if (activeCount(key) >= transportConfig.maxConnectionsPerScope) return undefined
-  return create(wsUrl, headers, true)
+  return create(wsUrl, headers, {}, true)
 }
 
 export function closeConnections(predicate: (conn: PooledConnection) => boolean = () => true, message = "Session disposed") {
@@ -712,6 +783,9 @@ export function closeConnections(predicate: (conn: PooledConnection) => boolean 
 export function resetPoolForTesting() {
   for (const conn of [...connectionPool]) {
     try {
+      conn.ws?.terminate?.()
+    } catch {}
+    try {
       conn.ws?.close(1000, "test reset")
     } catch {}
     remove(conn)
@@ -723,6 +797,8 @@ export function resetPoolForTesting() {
     }
   }
   acquisitionQueues.clear()
+  turnStateByContext.clear()
+  lastResponseIDByContext.clear()
 }
 
 export function setWebSocketConstructorForTesting(ctor: WebSocketConstructor) {
@@ -730,5 +806,5 @@ export function setWebSocketConstructorForTesting(ctor: WebSocketConstructor) {
 }
 
 export function resetWebSocketConstructorForTesting() {
-  WebSocketImpl = WebSocket as unknown as WebSocketConstructor
+  WebSocketImpl = loadDefaultWebSocketConstructor()
 }

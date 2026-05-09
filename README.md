@@ -8,7 +8,7 @@ Standalone OpenCode provider plugin for routing OpenAI Responses API streaming r
 - API-key transport: `wss://api.openai.com/v1/responses`
 - ChatGPT/Codex OAuth transport: `wss://chatgpt.com/backend-api/codex/responses`
 - Curated GPT/Codex model table with OpenCode variants
-- Best-effort model refresh from OpenCode's public `models.dev` catalog at auth-load time
+- Auth-aware model discovery at auth-load time: Codex backend models for ChatGPT OAuth, OpenAI `/v1/models` IDs for API keys, bundled table fallback for both
 - WebSocket-to-SSE bridge so OpenCode can keep using its normal streaming path
 
 ## Install
@@ -28,9 +28,9 @@ opencode auth login openai-ws
 
 The setup command is idempotent. It adds the npm plugin entry and a fallback `provider.openai-ws` model registry to `opencode.json`, preserving existing user model overrides.
 
-At runtime the plugin also attempts a short best-effort fetch from `https://models.dev/api.json` to pick up newly listed GPT/Codex models. It falls back to the bundled table if the catalog is unavailable. The OpenAI `/v1/models` endpoint is not used for catalog discovery because it requires authentication and returns only basic IDs/ownership metadata, not OpenCode capabilities, limits, or variants.
+At runtime the plugin also attempts short best-effort model discovery for the selected auth mode. ChatGPT/Codex OAuth uses `https://chatgpt.com/backend-api/codex/models`; API-key auth uses `https://api.openai.com/v1/models` as an availability filter around the bundled WebSocket model table. Both paths fall back to the bundled table if discovery is unavailable.
 
-Set `OPENAI_WS_OPENCODE_SKIP_CATALOG=1` to skip the `models.dev` lookup and use only the bundled fallback table plus your config overrides.
+Set `OPENAI_WS_OPENCODE_SKIP_CATALOG=1` to skip runtime catalog lookups and use only the bundled fallback table plus your config overrides.
 
 ## Manual config
 

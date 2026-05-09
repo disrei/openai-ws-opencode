@@ -12,7 +12,8 @@ import {
 } from "./constants.js"
 import { oauthMethods } from "./auth/oauth.js"
 import { extractAccountId, refreshAccessToken, tokenExpiry, type StoredOAuthAuth } from "./auth/tokens.js"
-import { resolveModelsBestEffort } from "./models/resolve.js"
+import { fetchCodexCatalog, fetchOpenAIModelIds } from "./models/catalog.js"
+import { resolveModelsForApiKey, resolveModelsForOAuth } from "./models/resolve.js"
 import { prepareHttpFallbackBody } from "./transport/body.js"
 import { bridgeWebSocket } from "./transport/bridge.js"
 import { closeConnections, ensureWarmConnection } from "./transport/pool.js"
@@ -82,10 +83,13 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
       provider: PROVIDER_ID,
       async loader(getAuth, provider) {
         const auth = (await getAuth()) as OpenAIWSAuth
-        if (provider) provider.models = (await resolveModelsBestEffort(provider.models as any)) as any
 
         if (auth?.type === "api" && auth.key) {
           const apiKey = auth.key
+          if (provider) {
+            const allowedIds = await fetchOpenAIModelIds({ apiKey })
+            provider.models = resolveModelsForApiKey(allowedIds, provider.models as any) as any
+          }
           const identity = transportIdentity({ type: "api", apiKey })
           ensureWarmConnection(identity.wsUrl, identity.wsHeaders)
           return {
@@ -118,6 +122,10 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
 
         if (auth?.type === "oauth") {
           const initialAuth = await resolveOAuthAuth(auth, client)
+          if (provider) {
+            const catalog = await fetchCodexCatalog({ accessToken: initialAuth.accessToken, accountId: initialAuth.accountId })
+            provider.models = resolveModelsForOAuth(catalog, provider.models as any) as any
+          }
           const initialIdentity = transportIdentity({ type: "oauth", accessToken: initialAuth.accessToken, accountId: initialAuth.accountId })
           ensureWarmConnection(initialIdentity.wsUrl, initialIdentity.wsHeaders)
           return {
@@ -145,10 +153,7 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
                 } catch {}
               }
 
-              const rewrittenUrl =
-                url.pathname.includes("/v1/responses") || url.pathname.includes("/chat/completions")
-                  ? new URL(CODEX_API_ENDPOINT)
-                  : url
+              const rewrittenUrl = url.pathname.includes("/v1/responses") ? new URL(CODEX_API_ENDPOINT) : url
               return globalThis.fetch(rewrittenUrl, {
                 ...init,
                 headers: httpAuthHeaders(context.forwardHeaders, { type: "oauth", accessToken, accountId }),

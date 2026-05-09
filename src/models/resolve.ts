@@ -1,4 +1,5 @@
 import { OPENAI_API_BASE, PROVIDER_ID } from "../constants.js"
+import type { CodexModelInfo } from "./catalog.js"
 import { makeVariants, OPENAI_WS_MODELS, type OpenAIWSModelDef } from "./defaults.js"
 
 export type ProviderModelConfig = {
@@ -27,24 +28,6 @@ export type ProviderModelConfig = {
 }
 
 export type ProviderModelOverrides = Record<string, Partial<ProviderModelConfig>>
-
-type ModelsDevModel = {
-  id?: string
-  name?: string
-  family?: string
-  attachment?: boolean
-  reasoning?: boolean
-  temperature?: boolean
-  tool_call?: boolean
-  release_date?: string
-  limit?: { context?: number; input?: number; output?: number }
-}
-
-type ModelsDevCatalog = {
-  openai?: {
-    models?: Record<string, ModelsDevModel>
-  }
-}
 
 export type OpenCodeConfigModel = {
   name: string
@@ -94,47 +77,55 @@ export function modelToProviderConfig(id: string, model: OpenAIWSModelDef): Prov
 function variantsForModel(id: string, model: Pick<OpenAIWSModelDef, "reasoning" | "family">): Record<string, Record<string, unknown>> {
   if (!model.reasoning) return {}
   if (id.endsWith("-pro") || model.family === "gpt-pro") return makeVariants(["high"], false)
-  if (id.includes("codex-spark")) return makeVariants(["low", "medium", "high"], false)
-  if (id.includes("codex")) return makeVariants(["low", "medium", "high"])
-  return makeVariants(["none", "minimal", "low", "medium", "high"])
+  if (id.includes("codex")) return makeVariants(["low", "medium", "high", "xhigh"], false)
+  return makeVariants(["none", "low", "medium", "high", "xhigh"], false)
 }
 
 function isOpenAIWSCandidate(id: string): boolean {
   return /^gpt-5(?:\.\d+)?(?:-(?:codex(?:-spark)?|pro|mini|nano|chat-latest))?$/.test(id)
 }
 
-function modelFromCatalog(id: string, model: ModelsDevModel): OpenAIWSModelDef | undefined {
-  if (!isOpenAIWSCandidate(id)) return undefined
-  const context = model.limit?.context
-  const output = model.limit?.output
-  if (!context || !output) return undefined
+function fallbackModelFor(id: string): OpenAIWSModelDef {
   const result: OpenAIWSModelDef = {
-    name: `${model.name ?? id} (WebSocket)`,
-    reasoning: model.reasoning ?? true,
-    temperature: model.temperature ?? false,
-    limit: {
-      context,
-      ...(model.limit?.input ? { input: model.limit.input } : {}),
-      output,
-    },
+    name: `${id} (WebSocket)`,
+    reasoning: true,
+    temperature: false,
+    limit: { context: 272000, output: 128000 },
     variants: {},
-    ...(model.family ? { family: model.family } : {}),
-    ...(model.release_date ? { release_date: model.release_date } : {}),
+    ...(id.includes("codex") ? { family: "gpt-codex" } : id.endsWith("-pro") ? { family: "gpt-pro" } : {}),
   }
   result.variants = variantsForModel(id, result)
   return result
 }
 
-export function resolveModelsFromCatalog(
-  catalog: ModelsDevCatalog | undefined,
+function modelFromCodexCatalog(model: CodexModelInfo): [string, OpenAIWSModelDef] | undefined {
+  const id = model.slug
+  if (!id) return undefined
+  if (model.prefer_websockets !== true && !isOpenAIWSCandidate(id)) return undefined
+  const context = model.context_window
+  if (!context) return undefined
+  const efforts = (model.supported_reasoning_levels ?? [])
+    .map((level) => level.effort)
+    .filter((effort): effort is string => Boolean(effort))
+  const reasoning = efforts.length > 0
+  const result: OpenAIWSModelDef = {
+    name: `${model.display_name ?? id} (WebSocket)`,
+    reasoning,
+    temperature: false,
+    limit: {
+      context,
+      output: model.auto_compact_token_limit ?? Math.min(context, 128000),
+    },
+    variants: reasoning ? makeVariants(efforts, Boolean(model.supports_reasoning_summaries)) : {},
+    ...(id.includes("codex") ? { family: "gpt-codex" } : id.endsWith("-pro") ? { family: "gpt-pro" } : {}),
+  }
+  return [id, result]
+}
+
+function toProviderModels(
+  models: Record<string, OpenAIWSModelDef>,
   overrides: ProviderModelOverrides = {},
 ): Record<string, ProviderModelConfig> {
-  const models: Record<string, OpenAIWSModelDef> = { ...OPENAI_WS_MODELS }
-  for (const [id, model] of Object.entries(catalog?.openai?.models ?? {})) {
-    const resolved = modelFromCatalog(id, model)
-    if (resolved) models[id] = resolved
-  }
-
   const providerModels: Record<string, ProviderModelConfig> = {}
   for (const [id, model] of Object.entries(models)) {
     providerModels[id] = {
@@ -159,26 +150,39 @@ export function resolveModelsFromCatalog(
 }
 
 export function resolveModels(overrides: ProviderModelOverrides = {}): Record<string, ProviderModelConfig> {
-  return resolveModelsFromCatalog(undefined, overrides)
+  return toProviderModels({ ...OPENAI_WS_MODELS }, overrides)
 }
 
-export async function resolveModelsBestEffort(
+export function resolveModelsForOAuth(
+  catalog: CodexModelInfo[] | undefined,
   overrides: ProviderModelOverrides = {},
-  options: { fetchImpl?: typeof fetch; timeoutMs?: number } = {},
-): Promise<Record<string, ProviderModelConfig>> {
-  if (process.env.OPENAI_WS_OPENCODE_SKIP_CATALOG === "1") return resolveModels(overrides)
-  const fetchImpl = options.fetchImpl ?? globalThis.fetch
-  const timeoutMs = options.timeoutMs ?? 800
-  try {
-    const response = await fetchImpl("https://models.dev/api.json", {
-      signal: AbortSignal.timeout(timeoutMs),
-      headers: { "User-Agent": "openai-ws-opencode/0.1.4" },
-    })
-    if (!response.ok) return resolveModels(overrides)
-    return resolveModelsFromCatalog((await response.json()) as ModelsDevCatalog, overrides)
-  } catch {
+): Record<string, ProviderModelConfig> {
+  if (!catalog?.length) return resolveModels(overrides)
+  const models: Record<string, OpenAIWSModelDef> = {}
+  for (const model of catalog) {
+    const resolved = modelFromCodexCatalog(model)
+    if (resolved) models[resolved[0]] = resolved[1]
+  }
+  if (Object.keys(models).length === 0) return resolveModels(overrides)
+  return toProviderModels(models, overrides)
+}
+
+export function resolveModelsForApiKey(
+  allowedIds: Set<string> | undefined,
+  overrides: ProviderModelOverrides = {},
+): Record<string, ProviderModelConfig> {
+  if (!allowedIds) return resolveModels(overrides)
+  const models: Record<string, OpenAIWSModelDef> = {}
+  for (const [id, model] of Object.entries(OPENAI_WS_MODELS)) {
+    if (allowedIds.has(id)) models[id] = model
+  }
+  for (const id of allowedIds) {
+    if (!models[id] && isOpenAIWSCandidate(id)) models[id] = fallbackModelFor(id)
+  }
+  if (Object.keys(models).length === 0) {
     return resolveModels(overrides)
   }
+  return toProviderModels(models, overrides)
 }
 
 export function modelToOpenCodeConfig(model: OpenAIWSModelDef): OpenCodeConfigModel {

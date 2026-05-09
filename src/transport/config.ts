@@ -7,6 +7,7 @@ export const transportConfig = {
   staleReuseMs: 60_000,
   heartbeatIntervalMs: 30_000,
   pongTimeoutMs: 10_000,
+  responseIdleTimeoutMs: 90_000,
   maxConnectionsPerScope: 4,
   connectionMaxAgeMs: 55 * 60 * 1000,
 }

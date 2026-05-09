@@ -7,6 +7,7 @@ import {
   INTERNAL_SESSION_HEADER,
   OPENAI_WS_BETA,
   OPENAI_WS_URL,
+  USER_AGENT,
 } from "../constants.js"
 
 export type TransportContext = {
@@ -16,19 +17,34 @@ export type TransportContext = {
   stablePrefixHash?: string
 }
 
+function defaultHeaders(): Record<string, string> {
+  return {
+    originator: CODEX_ORIGINATOR,
+    "OpenAI-Beta": OPENAI_WS_BETA,
+    "User-Agent": USER_AGENT,
+  }
+}
+
+function organizationProjectHeaders(): Record<string, string> {
+  return {
+    ...(process.env.OPENAI_ORGANIZATION ? { "OpenAI-Organization": process.env.OPENAI_ORGANIZATION } : {}),
+    ...(process.env.OPENAI_PROJECT ? { "OpenAI-Project": process.env.OPENAI_PROJECT } : {}),
+  }
+}
+
 export function apiKeyWebSocketHeaders(apiKey: string): Record<string, string> {
   return {
+    ...defaultHeaders(),
+    ...organizationProjectHeaders(),
     Authorization: `Bearer ${apiKey}`,
-    "OpenAI-Beta": OPENAI_WS_BETA,
   }
 }
 
 export function oauthWebSocketHeaders(accessToken: string, accountId?: string): Record<string, string> {
   return {
+    ...defaultHeaders(),
     Authorization: `Bearer ${accessToken}`,
     ...(accountId ? { "ChatGPT-Account-Id": accountId } : {}),
-    originator: CODEX_ORIGINATOR,
-    "OpenAI-Beta": OPENAI_WS_BETA,
   }
 }
 
@@ -40,10 +56,12 @@ export function httpAuthHeaders(
   headers.delete("authorization")
   headers.delete("Authorization")
   headers.set("Authorization", `Bearer ${auth.type === "api" ? auth.apiKey : auth.accessToken}`)
+  for (const [key, value] of Object.entries(defaultHeaders())) headers.set(key, value)
+  if (auth.type === "api") {
+    for (const [key, value] of Object.entries(organizationProjectHeaders())) headers.set(key, value)
+  }
   if (auth.type === "oauth") {
     if (auth.accountId) headers.set("ChatGPT-Account-Id", auth.accountId)
-    headers.set("originator", CODEX_ORIGINATOR)
-    headers.set("OpenAI-Beta", OPENAI_WS_BETA)
   }
   return headers
 }

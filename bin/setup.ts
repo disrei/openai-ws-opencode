@@ -18,6 +18,19 @@ export interface SetupOptions {
   cwd?: string
   configPath?: string
   pluginSpec?: string
+  cacheRepair?: boolean
+}
+
+interface CacheRepairOptions {
+  cacheHome?: string
+  packageVersion?: string
+  now?: () => Date
+}
+
+interface CacheRepairResult {
+  cachePath: string
+  movedTo?: string
+  repaired: boolean
 }
 
 function globalConfigPath(): string {
@@ -45,12 +58,17 @@ function applyJsonPatch(text: string, jsonPath: Array<string | number>, value: u
 }
 
 function pluginPackageName(specifier: string): string {
-  if (specifier.startsWith("file://")) return path.basename(new URL(specifier).pathname).replace(/\.[cm]?[jt]s$/, "")
+  if (specifier.startsWith("file:")) {
+    const filePath = specifier.startsWith("file://") ? new URL(specifier).pathname : specifier.slice("file:".length)
+    const base = path.basename(filePath)
+    if (base === PACKAGE_NAME || base.startsWith(`${PACKAGE_NAME}-`) || base.startsWith(`${PACKAGE_NAME}@`)) return PACKAGE_NAME
+    return base.replace(/(?:\.tgz|\.[cm]?[jt]s)$/, "")
+  }
   const lastAt = specifier.lastIndexOf("@")
   return lastAt > 0 ? specifier.slice(0, lastAt) : specifier
 }
 
-export function patchConfigText(input: string, pluginSpec = DEFAULT_PLUGIN_SPEC): string {
+export function patchConfigText(input: string, pluginSpec = DEFAULT_PLUGIN_SPEC, replacePluginSpec = false): string {
   let text = input.trim() ? input : "{}"
   const config = (parse(text) ?? {}) as Record<string, any>
 
@@ -58,8 +76,11 @@ export function patchConfigText(input: string, pluginSpec = DEFAULT_PLUGIN_SPEC)
 
   const current = ((parse(text) ?? {}) as Record<string, any>).plugin
   const plugins = Array.isArray(current) ? [...current] : []
-  if (!plugins.some((plugin) => typeof plugin === "string" && pluginPackageName(plugin) === PACKAGE_NAME)) {
+  const existingPluginIndex = plugins.findIndex((plugin) => typeof plugin === "string" && pluginPackageName(plugin) === PACKAGE_NAME)
+  if (existingPluginIndex === -1) {
     plugins.push(pluginSpec)
+  } else if (replacePluginSpec) {
+    plugins[existingPluginIndex] = pluginSpec
   }
   text = applyJsonPatch(text, ["plugin"], plugins)
 
@@ -77,6 +98,130 @@ export function patchConfigText(input: string, pluginSpec = DEFAULT_PLUGIN_SPEC)
   )
 }
 
+function isNotFound(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT"
+}
+
+function cacheHomePath(cacheHome = process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), ".cache")): string {
+  return cacheHome
+}
+
+function openCodeLatestCachePath(cacheHome?: string): string {
+  return path.join(cacheHomePath(cacheHome), "opencode", "packages", `${PACKAGE_NAME}@latest`)
+}
+
+async function pathExists(file: string): Promise<boolean> {
+  try {
+    await fs.access(file)
+    return true
+  } catch (error) {
+    if (isNotFound(error)) return false
+    throw error
+  }
+}
+
+async function readPackageVersion(packageJsonPath: string): Promise<string | undefined> {
+  try {
+    const text = await fs.readFile(packageJsonPath, "utf8")
+    const parsed = JSON.parse(text) as { version?: unknown }
+    return typeof parsed.version === "string" ? parsed.version : undefined
+  } catch (error) {
+    if (isNotFound(error)) return undefined
+    throw error
+  }
+}
+
+async function setupPackageVersion(): Promise<string> {
+  const packageJsonPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json")
+  const version = await readPackageVersion(packageJsonPath)
+  if (!version) throw new Error(`Unable to read setup package version from ${packageJsonPath}`)
+  return version
+}
+
+function semverParts(version: string): [number, number, number] | undefined {
+  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(version)
+  if (!match) return undefined
+  return [Number(match[1]), Number(match[2]), Number(match[3])]
+}
+
+function compareSemver(left: string, right: string): number {
+  const leftParts = semverParts(left)
+  const rightParts = semverParts(right)
+  if (!leftParts || !rightParts) return 0
+  for (let index = 0; index < leftParts.length; index++) {
+    if (leftParts[index] !== rightParts[index]) return leftParts[index] < rightParts[index] ? -1 : 1
+  }
+  return 0
+}
+
+const SOURCE_EXTENSIONS = new Set([".cjs", ".js", ".mjs", ".ts"])
+const BAD_OAUTH_PORT = /\bOAUTH_PORT\b\s*[:=]\s*1456\b/
+const BAD_CODEX_ORIGINATOR = /\bCODEX_ORIGINATOR\b\s*[:=]\s*["']codex_cli_rs["']/
+
+async function hasKnownBadConstants(packageRoot: string): Promise<boolean> {
+  const directories = [packageRoot]
+  let checkedFiles = 0
+
+  while (directories.length > 0 && checkedFiles < 500) {
+    const current = directories.pop()!
+    let entries: Array<import("node:fs").Dirent>
+    try {
+      entries = await fs.readdir(current, { withFileTypes: true })
+    } catch (error) {
+      if (isNotFound(error)) continue
+      throw error
+    }
+
+    for (const entry of entries) {
+      const entryPath = path.join(current, entry.name)
+      if (entry.isDirectory()) {
+        if (entry.name !== "node_modules" && entry.name !== ".git") directories.push(entryPath)
+        continue
+      }
+      if (!entry.isFile() || !SOURCE_EXTENSIONS.has(path.extname(entry.name))) continue
+
+      checkedFiles += 1
+      const source = await fs.readFile(entryPath, "utf8")
+      if (BAD_OAUTH_PORT.test(source) || BAD_CODEX_ORIGINATOR.test(source)) return true
+      if (checkedFiles >= 500) break
+    }
+  }
+
+  return false
+}
+
+function timestampForPath(date: Date): string {
+  return date.toISOString().replace(/[:.]/g, "-")
+}
+
+async function staleDestination(cachePath: string, now: Date): Promise<string> {
+  const base = `${cachePath}.stale-${timestampForPath(now)}`
+  let candidate = base
+  let suffix = 1
+  while (await pathExists(candidate)) {
+    candidate = `${base}-${suffix}`
+    suffix += 1
+  }
+  return candidate
+}
+
+export async function repairStaleOpenCodeLatestCache(options: CacheRepairOptions = {}): Promise<CacheRepairResult> {
+  const cachePath = openCodeLatestCachePath(options.cacheHome)
+  if (!(await pathExists(cachePath))) return { cachePath, repaired: false }
+
+  const packageRoot = path.join(cachePath, "node_modules", PACKAGE_NAME)
+  const cachedVersion = await readPackageVersion(path.join(packageRoot, "package.json"))
+  const currentVersion = options.packageVersion ?? (await setupPackageVersion())
+  const staleVersion = cachedVersion ? compareSemver(cachedVersion, currentVersion) < 0 : false
+  const staleConstants = await hasKnownBadConstants(packageRoot)
+
+  if (!staleVersion && !staleConstants) return { cachePath, repaired: false }
+
+  const movedTo = await staleDestination(cachePath, options.now?.() ?? new Date())
+  await fs.rename(cachePath, movedTo)
+  return { cachePath, movedTo, repaired: true }
+}
+
 export async function setupOpenCodeConfig(options: SetupOptions = {}): Promise<string> {
   const file = targetPath(options)
   let existing = ""
@@ -86,13 +231,21 @@ export async function setupOpenCodeConfig(options: SetupOptions = {}): Promise<s
     if (error?.code !== "ENOENT") throw error
   }
 
-  const updated = patchConfigText(existing, options.pluginSpec ?? DEFAULT_PLUGIN_SPEC)
+  const updated = patchConfigText(existing, options.pluginSpec ?? DEFAULT_PLUGIN_SPEC, Boolean(options.pluginSpec))
   await fs.mkdir(path.dirname(file), { recursive: true })
   await fs.writeFile(file, updated.endsWith("\n") ? updated : `${updated}\n`, "utf8")
+  if (options.cacheRepair !== false) {
+    try {
+      await repairStaleOpenCodeLatestCache()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      console.warn(`Warning: could not repair OpenCode cache at ${openCodeLatestCachePath()}. Remove it manually if OpenCode keeps loading stale plugin code. ${message}`)
+    }
+  }
   return file
 }
 
-function parseArgs(argv: string[]): SetupOptions {
+export function parseArgs(argv: string[]): SetupOptions {
   const options: SetupOptions = { mode: "global" }
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index]
@@ -100,8 +253,9 @@ function parseArgs(argv: string[]): SetupOptions {
     else if (arg === "--global") options.mode = "global"
     else if (arg === "--path") options.configPath = argv[++index]
     else if (arg === "--plugin") options.pluginSpec = argv[++index]
+    else if (arg === "--no-cache-repair") options.cacheRepair = false
     else if (arg === "--help" || arg === "-h") {
-      console.log("Usage: openai-ws-opencode setup [--global|--project] [--path <opencode.json>] [--plugin <specifier>]")
+      console.log("Usage: openai-ws-opencode setup [--global|--project] [--path <opencode.json>] [--plugin <specifier>] [--no-cache-repair]")
       process.exit(0)
     }
   }

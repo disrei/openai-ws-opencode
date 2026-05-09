@@ -101,7 +101,7 @@ Then point OpenCode at the packed tarball through the plugin array:
 
 ```jsonc
 {
-  "plugin": ["openai-ws-opencode@file:/absolute/path/openai-ws-opencode-0.1.4.tgz"]
+  "plugin": ["openai-ws-opencode@file:/absolute/path/openai-ws-opencode-0.1.5.tgz"]
 }
 ```
 

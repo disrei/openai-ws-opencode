@@ -10,6 +10,7 @@ import { CLIENT_ID, CODEX_ORIGINATOR } from "../src/constants.js"
 import {
   apiKeyWebSocketHeaders,
   bridgeWebSocket,
+  connectionPool,
   oauthTesting,
   oauthWebSocketHeaders,
   prepareBody,
@@ -440,9 +441,9 @@ describe("websocket bridge", () => {
     expect(error).not.toHaveBeenCalled()
   })
 
-  test("does not retry after response.create was sent before close", () => {
+  test("retries when websocket closes after response.create but before any frame is forwarded", async () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
-    bridgeWebSocket(
+    const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
       { model: "gpt-5.5", input: "hi", stream: true },
@@ -452,10 +453,122 @@ describe("websocket bridge", () => {
     first.open()
     expect(first.sent).toHaveLength(1)
     first.close()
+
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect(MockWebSocket.instances).toHaveLength(2)
+
+    const second = MockWebSocket.instances[1]
+    second.open()
+    expect(second.sent).toHaveLength(1)
+    expect(JSON.parse(second.sent[0])).toMatchObject({ type: "response.create", model: "gpt-5.5" })
+
+    second.serverMessage({ type: "response.completed" })
+
+    const reader = response.body!.getReader()
+    let seenCompleted = false
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      if (new TextDecoder().decode(value).includes("response.completed")) seenCompleted = true
+    }
+    expect(seenCompleted).toBe(true)
+  })
+
+  test("surfaces detailed error after close following a forwarded frame", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "hi", stream: true },
+      false,
+    )
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    ws.serverMessage({ type: "response.output_text.delta", delta: "hi" })
+
+    const reader = response.body!.getReader()
+    await reader.read()
+
+    ws.emit("close", 1006, Buffer.from("abnormal"))
+
+    await expect(reader.read()).rejects.toThrow(
+      /stream already forwarded data.*closeCode=1006.*closeReason="abnormal"/s,
+    )
     expect(MockWebSocket.instances).toHaveLength(1)
   })
 
-  test("clears delayed reconnect after abort before response.create", async () => {
+  test("surfaces retry-limit error with close diagnostics when every reconnect fails", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "hi", stream: true },
+      false,
+    )
+    const reader = response.body!.getReader()
+
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const ws = MockWebSocket.instances[attempt]
+      expect(ws).toBeDefined()
+      ws.open()
+      ws.emit("close", 1011, Buffer.from("server_error"))
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 150))
+    }
+
+    await expect(reader.read()).rejects.toThrow(
+      /retry limit reached before any frame was forwarded.*reconnectAttempts=3\/3.*closeCode=1011/s,
+    )
+    expect(MockWebSocket.instances).toHaveLength(4)
+  })
+
+  test("evicts stale idle connections before reuse", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const first = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "hi", stream: true },
+      false,
+    )
+    const firstWs = MockWebSocket.instances[0]
+    firstWs.open()
+    firstWs.serverMessage({ type: "response.completed" })
+    const firstReader = first.body!.getReader()
+    while (!(await firstReader.read()).done) {}
+    expect(connectionPool).toHaveLength(1)
+    expect(connectionPool[0].busy).toBe(false)
+
+    connectionPool[0].lastActivityAt = 0
+
+    bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "hello", stream: true },
+      false,
+    )
+    expect(MockWebSocket.instances).toHaveLength(2)
+    expect(firstWs.readyState).toBe(3)
+  })
+
+  test("release is a no-op for heartbeat when websocket has no ping method", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "hi", stream: true },
+      false,
+    )
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    ws.serverMessage({ type: "response.completed" })
+    const reader = response.body!.getReader()
+    while (!(await reader.read()).done) {}
+
+    expect(connectionPool).toHaveLength(1)
+    expect(connectionPool[0].heartbeatTimer).toBeNull()
+    expect(connectionPool[0].pongTimer).toBeNull()
+  })
+
+  test("clears delayed reconnect after abort before any frame is forwarded", async () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const controller = new AbortController()
     bridgeWebSocket(

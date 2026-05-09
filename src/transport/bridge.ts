@@ -1,5 +1,5 @@
 import { prepareBody } from "./body.js"
-import { acquireConnection, closeConnections, type PooledConnection } from "./pool.js"
+import { acquireConnection, closeConnections, sendPending, type PooledConnection } from "./pool.js"
 import type { TransportContext } from "./headers.js"
 
 function abortPending(conn: PooledConnection, error: Error) {
@@ -60,10 +60,7 @@ export function bridgeWebSocket(
         return
       }
       if (signal) signal.addEventListener("abort", onAbort, { once: true })
-      if (conn.ws?.readyState === 1) {
-        conn.ws.send(JSON.stringify({ type: "response.create", ...wsBody }))
-        conn.pending.sent = true
-      }
+      sendPending(conn)
     },
     cancel() {
       if (finalized) return

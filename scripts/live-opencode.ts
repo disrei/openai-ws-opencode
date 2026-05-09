@@ -361,7 +361,7 @@ async function runLiveTurn(
       const text = chunk.toString("utf8")
       stderr += text
       if (/service=llm\b.*providerID=openai-ws\b.*\bstream\b/i.test(text)) startStreamTimer()
-      if (/response\.(created|completed|output_text\.delta|output_item|function_call)/i.test(text)) markStreaming()
+      if (/response\.(created|completed|output_text\.delta|output_item|function_call)|message\.part\.delta/i.test(text)) markStreaming()
       if (/\b(tool|tool_call|function_call)\b/i.test(text)) sawTool = true
     })
     child.on("error", (error) => {

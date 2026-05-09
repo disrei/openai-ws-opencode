@@ -155,6 +155,10 @@ function headerValue(source: unknown, name: string): string | undefined {
   return Array.isArray(value) ? String(value[0]) : value === undefined || value === null ? undefined : String(value)
 }
 
+function supportsUpgradeEvent(constructor: WebSocketConstructor): boolean {
+  return process.versions.bun === undefined || constructor.name !== "WebSocket"
+}
+
 function clearTimer(timer: ReturnType<typeof setTimeout> | null) {
   if (timer) clearTimeout(timer)
 }
@@ -541,24 +545,25 @@ function connect(conn: PooledConnection) {
     handleSocketLoss(conn)
   }
 
+  const attachUpgrade = supportsUpgradeEvent(WebSocketImpl)
   const ws = new WebSocketImpl(conn.wsUrl, {
     headers: conn.headers,
     perMessageDeflate: true,
     finishRequest(request) {
-      request.on?.("upgrade", handleUpgrade)
+      if (attachUpgrade) request.on?.("upgrade", handleUpgrade)
       request.end?.()
     },
   })
   conn.ws = ws
   on(ws, "open", handleOpen)
-  on(ws, "upgrade", handleUpgrade)
+  if (attachUpgrade) on(ws, "upgrade", handleUpgrade)
   on(ws, "message", handleMessage)
   on(ws, "error", handleError)
   on(ws, "close", handleClose)
 
   conn.detach = () => {
     off(ws, "open", handleOpen)
-    off(ws, "upgrade", handleUpgrade)
+    if (attachUpgrade) off(ws, "upgrade", handleUpgrade)
     off(ws, "message", handleMessage)
     off(ws, "error", handleError)
     off(ws, "close", handleClose)

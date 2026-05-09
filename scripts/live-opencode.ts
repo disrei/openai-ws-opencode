@@ -10,7 +10,7 @@ const defaultOpencodeBin = path.join(os.homedir(), ".opencode", "bin", "opencode
 const opencodeBin = process.env.OPENCODE_BIN ?? (existsSync(defaultOpencodeBin) ? defaultOpencodeBin : "opencode")
 const model = process.env.OPENAI_WS_LIVE_MODEL ?? "openai-ws/gpt-5.4-mini"
 const agent = process.env.OPENAI_WS_LIVE_AGENT
-const streamStartTimeoutMs = numberEnv("OPENAI_WS_LIVE_STREAM_START_MS", 5_000)
+const streamStartTimeoutMs = numberEnv("OPENAI_WS_LIVE_STREAM_START_MS", 3_000)
 const turnTimeoutMs = numberEnv("OPENAI_WS_LIVE_TURN_TIMEOUT_MS", 60_000)
 const requireAuth = process.env.OPENAI_WS_LIVE === "1" || process.env.OPENAI_WS_LIVE_REQUIRED === "1"
 const keepArtifacts = process.env.OPENAI_WS_LIVE_KEEP_ARTIFACTS === "1"

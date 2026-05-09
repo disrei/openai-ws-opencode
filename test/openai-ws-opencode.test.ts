@@ -5,8 +5,10 @@ import os from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { describe, expect, test, afterEach, vi } from "vitest"
+import WebSocket from "ws"
 import plugin from "../src/index.js"
 import { createBrowserAuthorization } from "../src/auth/oauth.js"
+import { loadDefaultWebSocketConstructor } from "../src/transport/bun-websocket.js"
 import { transportConfig } from "../src/transport/config.js"
 import {
   CLIENT_ID,
@@ -112,7 +114,7 @@ type WireServerSocket = {
   close?: () => void
 }
 
-type WireTurn = { headers: Record<string, string>; body?: Record<string, unknown> }
+type WireTurn = { headers: Record<string, string>; body?: Record<string, unknown>; bodies: Record<string, unknown>[] }
 
 function listenWireWebSocket(received: WireTurn[]) {
   const listen = (globalThis as { Bun?: { listen?: (options: unknown) => { port: number; stop(force?: boolean): void } } }).Bun?.listen
@@ -140,7 +142,7 @@ function listenWireWebSocket(received: WireTurn[]) {
           const requestText = state.handshake.subarray(0, split).toString("utf8")
           rest = Buffer.from(state.handshake.subarray(split + 4))
           const headers = parseWireHeaders(requestText)
-          const turn: WireTurn = { headers }
+          const turn: WireTurn = { headers, bodies: [] }
           received.push(turn)
           state.turn = turn
           socket.write(wireUpgradeResponse(headers["sec-websocket-key"]))
@@ -213,6 +215,7 @@ function receiveWireFrames(
     if (opcode !== 0x1 || !state.turn) continue
     const body = JSON.parse(payload.toString("utf8")) as Record<string, unknown>
     state.turn.body = body
+    if (body.type === "response.create") state.turn.bodies.push(body)
     socket.write(encodeWireTextFrame(JSON.stringify({ type: "response.completed", response: { id: `resp_live_${wireInputText(body)}` } })))
   }
 }
@@ -985,6 +988,10 @@ describe("websocket bridge", () => {
     expect(error).not.toHaveBeenCalled()
   })
 
+  test("uses ws instead of the Bun socket path for default websocket transport", () => {
+    expect(loadDefaultWebSocketConstructor()).toBe(WebSocket)
+  })
+
   test("does not replay response.create after the websocket closes", async () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const response = bridgeWebSocket(
@@ -1455,7 +1462,8 @@ describe("websocket bridge", () => {
       )
       const secondText = await readAll(second)
 
-      expect(received).toHaveLength(2)
+      const createBodies = received.flatMap((turn) => turn.bodies)
+      expect(createBodies).toHaveLength(2)
       expect(received[0].headers).toMatchObject({
         authorization: "Bearer api-key-test",
         originator: CODEX_ORIGINATOR,
@@ -1466,8 +1474,8 @@ describe("websocket bridge", () => {
         "x-openai-subagent": "review",
       })
       expect(received[0].headers).not.toHaveProperty("x-codex-turn-state")
-      expect(received[1].headers).toMatchObject({ "x-codex-turn-state": "turn_live" })
-      expect(received[0].body).toMatchObject({
+      if (received[1]) expect(received[1].headers).toMatchObject({ "x-codex-turn-state": "turn_live" })
+      expect(createBodies[0]).toMatchObject({
         type: "response.create",
         model: "gpt-5.5",
         instructions: "You are a helpful assistant.",
@@ -1480,7 +1488,7 @@ describe("websocket bridge", () => {
           "x-openai-subagent": "review",
         },
       })
-      expect(received[1].body).toMatchObject({ type: "response.create", previous_response_id: "resp_live_hi" })
+      expect(createBodies[1]).toMatchObject({ type: "response.create", previous_response_id: "resp_live_hi" })
       expect(firstText).toContain("response.completed")
       expect(secondText).toContain("response.completed")
     } finally {

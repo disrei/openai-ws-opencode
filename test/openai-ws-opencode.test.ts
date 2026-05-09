@@ -1,4 +1,8 @@
 import { EventEmitter } from "node:events"
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import os from "node:os"
+import path from "node:path"
+import { pathToFileURL } from "node:url"
 import { describe, expect, test, afterEach, vi } from "vitest"
 import plugin from "../src/index.js"
 import {
@@ -13,7 +17,7 @@ import {
   resolveModelsFromCatalog,
   setWebSocketConstructorForTesting,
 } from "../src/testing.js"
-import { patchConfigText } from "../bin/setup.ts"
+import { isDirectExecution, patchConfigText } from "../bin/setup.ts"
 
 class MockWebSocket extends EventEmitter {
   static instances: MockWebSocket[] = []
@@ -82,6 +86,19 @@ describe("setup", () => {
     const patched = patchConfigText(JSON.stringify({ plugin: ["openai-ws-opencode@0.1.0"] }))
     const parsed = JSON.parse(patched)
     expect(parsed.plugin).toEqual(["openai-ws-opencode@0.1.0"])
+  })
+
+  test("detects npm bin symlink execution", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "openai-ws-opencode-"))
+    try {
+      const target = path.join(dir, "setup.js")
+      const link = path.join(dir, "openai-ws-opencode")
+      writeFileSync(target, "")
+      symlinkSync(target, link)
+      expect(isDirectExecution(pathToFileURL(target).href, link)).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
 

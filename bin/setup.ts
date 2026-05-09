@@ -1,7 +1,9 @@
 #!/usr/bin/env node
+import { realpathSync } from "node:fs"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { fileURLToPath } from "node:url"
 import { applyEdits, format, modify, parse } from "jsonc-parser"
 import { providerConfig } from "../src/models/resolve.js"
 
@@ -106,7 +108,17 @@ function parseArgs(argv: string[]): SetupOptions {
   return options
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+export function isDirectExecution(moduleUrl = import.meta.url, argvPath = process.argv[1]): boolean {
+  if (!argvPath) return false
+  const modulePath = fileURLToPath(moduleUrl)
+  try {
+    return realpathSync(modulePath) === realpathSync(argvPath)
+  } catch {
+    return path.resolve(modulePath) === path.resolve(argvPath)
+  }
+}
+
+if (isDirectExecution()) {
   setupOpenCodeConfig(parseArgs(process.argv.slice(2)))
     .then((file) => {
       console.log(`Updated OpenCode config: ${file}`)

@@ -15,7 +15,7 @@ import { extractAccountId, refreshAccessToken, tokenExpiry, type StoredOAuthAuth
 import { resolveModelsBestEffort } from "./models/resolve.js"
 import { prepareHttpFallbackBody } from "./transport/body.js"
 import { bridgeWebSocket } from "./transport/bridge.js"
-import { closeConnections } from "./transport/pool.js"
+import { closeConnections, ensureWarmConnection } from "./transport/pool.js"
 import { extractTransportContext, httpAuthHeaders, transportIdentity } from "./transport/headers.js"
 
 type ApiAuth = { type: "api"; key?: string }
@@ -87,6 +87,7 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
         if (auth?.type === "api" && auth.key) {
           const apiKey = auth.key
           const identity = transportIdentity({ type: "api", apiKey })
+          ensureWarmConnection(identity.wsUrl, identity.wsHeaders)
           return {
             apiKey,
             baseURL: OPENAI_API_BASE,
@@ -117,6 +118,8 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
 
         if (auth?.type === "oauth") {
           const initialAuth = await resolveOAuthAuth(auth, client)
+          const initialIdentity = transportIdentity({ type: "oauth", accessToken: initialAuth.accessToken, accountId: initialAuth.accountId })
+          ensureWarmConnection(initialIdentity.wsUrl, initialIdentity.wsHeaders)
           return {
             apiKey: initialAuth.accessToken,
             baseURL: CODEX_API_BASE,

@@ -26,6 +26,8 @@ class MockWebSocket extends EventEmitter {
   static instances: MockWebSocket[] = []
   readyState = 0
   sent: string[] = []
+  pingCount = 0
+  terminateCount = 0
   url: string
   options: { headers: Record<string, string> }
 
@@ -45,6 +47,19 @@ class MockWebSocket extends EventEmitter {
     this.emit("close")
   }
 
+  terminate() {
+    this.terminateCount++
+    this.readyState = 3
+  }
+
+  ping() {
+    this.pingCount++
+  }
+
+  pong() {
+    this.emit("pong")
+  }
+
   open() {
     this.readyState = 1
     this.emit("open")
@@ -58,6 +73,7 @@ class MockWebSocket extends EventEmitter {
 const originalXdgCacheHome = process.env.XDG_CACHE_HOME
 
 afterEach(() => {
+  vi.useRealTimers()
   oauthTesting.reset()
   resetPoolForTesting()
   resetWebSocketConstructorForTesting()
@@ -454,7 +470,7 @@ describe("websocket bridge", () => {
     expect(first.sent).toHaveLength(1)
     first.close()
 
-    await new Promise((resolve) => setTimeout(resolve, 150))
+    await new Promise((resolve) => setTimeout(resolve, 250))
     expect(MockWebSocket.instances).toHaveLength(2)
 
     const second = MockWebSocket.instances[1]
@@ -474,7 +490,7 @@ describe("websocket bridge", () => {
     expect(seenCompleted).toBe(true)
   })
 
-  test("surfaces detailed error after close following a forwarded frame", async () => {
+  test("emits synthetic incomplete after close following replay-unsafe data", async () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const response = bridgeWebSocket(
       "wss://example.test/responses",
@@ -484,17 +500,74 @@ describe("websocket bridge", () => {
     )
     const ws = MockWebSocket.instances[0]
     ws.open()
-    ws.serverMessage({ type: "response.output_text.delta", delta: "hi" })
+    ws.serverMessage({
+      type: "response.created",
+      sequence_number: 0,
+      response: {
+        id: "resp_1",
+        model: "gpt-5.5",
+        service_tier: null,
+        usage: {
+          input_tokens: 1,
+          output_tokens: 0,
+          total_tokens: 1,
+          input_tokens_details: { cached_tokens: 0 },
+          output_tokens_details: { reasoning_tokens: 0 },
+        },
+      },
+    })
+    ws.serverMessage({ type: "response.output_text.delta", sequence_number: 1, delta: "hi" })
 
     const reader = response.body!.getReader()
-    await reader.read()
+    const first = await reader.read()
+    const second = await reader.read()
+    expect(new TextDecoder().decode(first.value)).toContain("response.created")
+    expect(new TextDecoder().decode(second.value)).toContain("response.output_text.delta")
 
     ws.emit("close", 1006, Buffer.from("abnormal"))
 
-    await expect(reader.read()).rejects.toThrow(
-      /stream already forwarded data.*closeCode=1006.*closeReason="abnormal"/s,
-    )
+    const incomplete = await reader.read()
+    const text = new TextDecoder().decode(incomplete.value)
+    expect(text).toContain("response.incomplete")
+    expect(text).toContain('"reason":"transport_error"')
+    expect(text).toContain('"closeCode":1006')
+    expect(text).toContain('"closeReason":"abnormal"')
+    expect(text).toContain('"input_tokens":1')
+    expect(text).toContain('"service_tier":null')
+    await expect(reader.read()).resolves.toMatchObject({ done: true })
     expect(MockWebSocket.instances).toHaveLength(1)
+  })
+
+  test("retries after replay-safe response.created only", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "hi", stream: true },
+      false,
+    )
+    const first = MockWebSocket.instances[0]
+    first.open()
+    first.serverMessage({ type: "response.created", sequence_number: 0, response: { id: "resp_1" } })
+
+    const reader = response.body!.getReader()
+    const created = await reader.read()
+    expect(new TextDecoder().decode(created.value)).toContain("response.created")
+
+    first.emit("close", 1006, Buffer.from("abnormal"))
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    expect(MockWebSocket.instances).toHaveLength(2)
+
+    const second = MockWebSocket.instances[1]
+    second.open()
+    second.serverMessage({ type: "response.completed", response: { id: "resp_2" } })
+    let seenCompleted = false
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      if (new TextDecoder().decode(value).includes("response.completed")) seenCompleted = true
+    }
+    expect(seenCompleted).toBe(true)
   })
 
   test("surfaces retry-limit error with close diagnostics when every reconnect fails", async () => {
@@ -512,7 +585,7 @@ describe("websocket bridge", () => {
       expect(ws).toBeDefined()
       ws.open()
       ws.emit("close", 1011, Buffer.from("server_error"))
-      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 150))
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 450))
     }
 
     await expect(reader.read()).rejects.toThrow(
@@ -549,7 +622,7 @@ describe("websocket bridge", () => {
     expect(firstWs.readyState).toBe(3)
   })
 
-  test("release is a no-op for heartbeat when websocket has no ping method", async () => {
+  test("release schedules heartbeat when websocket supports ping", async () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const response = bridgeWebSocket(
       "wss://example.test/responses",
@@ -564,8 +637,58 @@ describe("websocket bridge", () => {
     while (!(await reader.read()).done) {}
 
     expect(connectionPool).toHaveLength(1)
-    expect(connectionPool[0].heartbeatTimer).toBeNull()
+    expect(connectionPool[0].heartbeatTimer).not.toBeNull()
     expect(connectionPool[0].pongTimer).toBeNull()
+  })
+
+  test("active pending heartbeat pings and pong timeout emits synthetic incomplete", async () => {
+    vi.useFakeTimers()
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "hi", stream: true },
+      false,
+    )
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    ws.serverMessage({ type: "response.output_text.delta", sequence_number: 1, delta: "hi" })
+    const reader = response.body!.getReader()
+    await reader.read()
+
+    vi.advanceTimersByTime(30_000)
+    await Promise.resolve()
+    expect(ws.pingCount).toBeGreaterThan(0)
+    vi.advanceTimersByTime(10_000)
+    await Promise.resolve()
+
+    const incomplete = await reader.read()
+    expect(new TextDecoder().decode(incomplete.value)).toContain("response.incomplete")
+    expect(ws.terminateCount).toBeGreaterThan(0)
+  })
+
+  test("concurrent streams are bounded and queued per scope", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const responses = Array.from({ length: 5 }, (_, index) =>
+      bridgeWebSocket(
+        "wss://example.test/responses",
+        apiKeyWebSocketHeaders("api-key-test"),
+        { model: "gpt-5.5", input: `hi ${index}`, stream: true },
+        false,
+        { sessionID: "sess_1", agent: "agent" },
+      ),
+    )
+    expect(MockWebSocket.instances).toHaveLength(4)
+    for (const ws of MockWebSocket.instances) ws.open()
+    expect(MockWebSocket.instances.every((ws) => ws.sent.length === 1)).toBe(true)
+
+    MockWebSocket.instances[0].serverMessage({ type: "response.completed", response: { id: "resp_done" } })
+    const reader = responses[0].body!.getReader()
+    while (!(await reader.read()).done) {}
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(MockWebSocket.instances).toHaveLength(4)
+    expect(MockWebSocket.instances.some((ws) => ws.sent.length === 2)).toBe(true)
   })
 
   test("clears delayed reconnect after abort before any frame is forwarded", async () => {

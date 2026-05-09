@@ -4,9 +4,11 @@ export { apiKeyWebSocketHeaders, oauthWebSocketHeaders, extractTransportContext,
 export {
   connectionPool,
   readyState,
+  ensureWarmConnection,
   resetPoolForTesting,
   resetWebSocketConstructorForTesting,
   setWebSocketConstructorForTesting,
 } from "./transport/pool.js"
 export { bridgeWebSocket } from "./transport/bridge.js"
 export { resolveModels, resolveModelsBestEffort, resolveModelsFromCatalog, providerConfig } from "./models/resolve.js"
+export { transportConfig } from "./transport/config.js"

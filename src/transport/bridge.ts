@@ -15,7 +15,8 @@ function abortPending(conn: PooledConnection, error: Error) {
     pending.controller.error(error)
   } catch {}
   conn.pending = null
-  closeConnections((candidate) => candidate === conn)
+  conn.busy = false
+  closeConnections((candidate) => candidate === conn, "Client aborted")
 }
 
 export function bridgeWebSocket(
@@ -27,7 +28,7 @@ export function bridgeWebSocket(
   signal?: AbortSignal,
 ): Response {
   const wsBody = prepareBody(requestBody, isOAuth)
-  const conn = acquireConnection(wsUrl, headers, context)
+  let conn: PooledConnection | undefined
   let finalized = false
 
   const cleanupAbort = () => {
@@ -38,35 +39,55 @@ export function bridgeWebSocket(
     if (finalized) return
     finalized = true
     cleanupAbort()
-    abortPending(conn, signal?.reason instanceof Error ? signal.reason : new DOMException("Aborted", "AbortError"))
+    if (conn) abortPending(conn, signal?.reason instanceof Error ? signal.reason : new DOMException("Aborted", "AbortError"))
+  }
+
+  const startStream = (controller: ReadableStreamDefaultController<Uint8Array>, acquired: PooledConnection) => {
+    conn = acquired
+    if (finalized || signal?.aborted) {
+      abortPending(conn, signal?.reason instanceof Error ? signal.reason : new DOMException("Aborted", "AbortError"))
+      return
+    }
+    conn.activeSessionID = context.sessionID
+    conn.activeAgent = context.agent
+    conn.lastModelID = context.modelID ?? conn.lastModelID
+    conn.lastStablePrefixHash = context.stablePrefixHash ?? conn.lastStablePrefixHash
+    conn.pending = {
+      body: wsBody,
+      controller,
+      done: false,
+      sent: false,
+      forwarded: false,
+      replayUnsafeForwarded: false,
+      frameCount: 0,
+      metadata: {},
+    }
+    sendPending(conn)
   }
 
   const readable = new ReadableStream<Uint8Array>({
     start(controller) {
-      conn.activeSessionID = context.sessionID
-      conn.activeAgent = context.agent
-      conn.lastModelID = context.modelID ?? conn.lastModelID
-      conn.lastStablePrefixHash = context.stablePrefixHash ?? conn.lastStablePrefixHash
-      conn.pending = {
-        body: wsBody,
-        controller,
-        done: false,
-        sent: false,
-        forwarded: false,
-      }
-
       if (signal?.aborted) {
-        onAbort()
+        controller.error(signal.reason instanceof Error ? signal.reason : new DOMException("Aborted", "AbortError"))
         return
       }
       if (signal) signal.addEventListener("abort", onAbort, { once: true })
-      sendPending(conn)
+      const acquired = acquireConnection(wsUrl, headers, context, signal)
+      if (acquired instanceof Promise) {
+        acquired.then((next) => startStream(controller, next)).catch((error) => {
+          finalized = true
+          cleanupAbort()
+          controller.error(error instanceof Error ? error : new Error(String(error)))
+        })
+        return
+      }
+      startStream(controller, acquired)
     },
     cancel() {
       if (finalized) return
       finalized = true
       cleanupAbort()
-      abortPending(conn, new DOMException("Aborted", "AbortError"))
+      if (conn) abortPending(conn, new DOMException("Aborted", "AbortError"))
     },
   })
 

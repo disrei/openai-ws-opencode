@@ -52,8 +52,9 @@ class MockWebSocket extends EventEmitter {
     MockWebSocket.instances.push(this)
   }
 
-  send(data: string) {
+  send(data: string, callback?: (error?: Error) => void) {
     this.sent.push(data)
+    callback?.()
   }
 
   close() {
@@ -89,6 +90,19 @@ class MockWebSocket extends EventEmitter {
 
   upgrade(headers: Record<string, string>) {
     this.emit("upgrade", { headers })
+  }
+}
+
+class DeferredSendWebSocket extends MockWebSocket {
+  sendCallbacks: Array<(error?: Error) => void> = []
+
+  send(data: string, callback?: (error?: Error) => void) {
+    this.sent.push(data)
+    if (callback) this.sendCallbacks.push(callback)
+  }
+
+  commitNextSend(error?: Error) {
+    this.sendCallbacks.shift()?.(error)
   }
 }
 
@@ -199,8 +213,23 @@ function receiveWireFrames(
     if (opcode !== 0x1 || !state.turn) continue
     const body = JSON.parse(payload.toString("utf8")) as Record<string, unknown>
     state.turn.body = body
-    socket.write(encodeWireTextFrame(JSON.stringify({ type: "response.completed", response: { id: `resp_live_${body.input}` } })))
+    socket.write(encodeWireTextFrame(JSON.stringify({ type: "response.completed", response: { id: `resp_live_${wireInputText(body)}` } })))
   }
+}
+
+function wireInputText(body: Record<string, unknown>): string {
+  const input = body.input
+  if (typeof input === "string") return input
+  if (!Array.isArray(input)) return ""
+  const first = input[0]
+  if (!first || typeof first !== "object" || Array.isArray(first)) return ""
+  const content = (first as Record<string, unknown>).content
+  if (typeof content === "string") return content
+  if (!Array.isArray(content)) return ""
+  const part = content[0]
+  if (!part || typeof part !== "object" || Array.isArray(part)) return ""
+  const text = (part as Record<string, unknown>).text
+  return typeof text === "string" ? text : ""
 }
 
 function encodeWireTextFrame(text: string): Buffer {
@@ -474,14 +503,23 @@ describe("body and headers", () => {
   test("prepares API and OAuth response bodies", () => {
     process.env[OPENAI_WS_INSTALLATION_ID_ENV] = "install_1"
     const api = prepareBody(
-      { stream: true, stream_options: {}, service_tier: "priority", client_metadata: { existing: "yes", ignored: 1 } },
+      {
+        stream: true,
+        stream_options: {},
+        background: true,
+        service_tier: "priority",
+        input: "hello",
+        client_metadata: { existing: "yes", ignored: 1 },
+      },
       false,
       { sessionID: "sess_1", agent: "review", stablePrefixHash: "prefix_1" },
     )
     expect(api).toMatchObject({
+      instructions: "You are a helpful assistant.",
       stream: true,
       store: false,
       service_tier: "priority",
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] }],
       prompt_cache_key: "prefix_1",
       client_metadata: {
         existing: "yes",
@@ -490,14 +528,24 @@ describe("body and headers", () => {
         "x-openai-subagent": "review",
       },
     })
-    expect(api).not.toHaveProperty("instructions")
     expect(api).not.toHaveProperty("stream_options")
+    expect(api).not.toHaveProperty("background")
 
     const oauth = prepareBody({ stream: true, max_output_tokens: 10, max_tokens: 10 }, true)
     expect(oauth.store).toBe(false)
     expect(oauth.stream).toBe(true)
-    expect(oauth.max_output_tokens).toBe(10)
-    expect(oauth.max_tokens).toBe(10)
+    expect(oauth.instructions).toBe("You are a helpful assistant.")
+    expect(oauth).not.toHaveProperty("max_output_tokens")
+    expect(oauth).not.toHaveProperty("max_tokens")
+  })
+
+  test("canonicalizes response input items for the websocket endpoint", () => {
+    expect(prepareBody({ input: [{ role: "assistant", content: "hi" }] }, true).input).toEqual([
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "hi" }] },
+    ])
+    expect(prepareBody({ input: [{ type: "message", role: "user", content: [{ type: "text", text: "hi" }] }] }, true).input).toEqual([
+      { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+    ])
   })
 
   test("builds required API key and OAuth websocket headers", () => {
@@ -809,7 +857,8 @@ describe("websocket bridge", () => {
     expect(JSON.parse(ws.sent[0])).toMatchObject({
       type: "response.create",
       model: "gpt-5.3-codex",
-      input: "hi",
+      instructions: "You are a helpful assistant.",
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
       store: false,
       stream: true,
     })
@@ -950,8 +999,72 @@ describe("websocket bridge", () => {
     expect(first.sent).toHaveLength(1)
     first.close()
 
-    await expect(reader.read()).rejects.toThrow(/response\.create was already sent/)
+    await expect(reader.read()).rejects.toThrow(/response\.create was already sent.*responseCreateWriteCommitted=true/s)
     expect(MockWebSocket.instances).toHaveLength(1)
+  })
+
+  test("retries when the websocket closes before response.create write commits", async () => {
+    vi.useFakeTimers()
+    setWebSocketConstructorForTesting(DeferredSendWebSocket as any)
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "hi", stream: true },
+      false,
+    )
+    const reader = response.body!.getReader()
+    const first = MockWebSocket.instances[0] as DeferredSendWebSocket
+    first.open()
+    expect(first.sent).toHaveLength(1)
+
+    first.emit("close", 1006, Buffer.from("abnormal"))
+    vi.advanceTimersByTime(100)
+    await Promise.resolve()
+
+    const second = MockWebSocket.instances[1] as DeferredSendWebSocket
+    second.open()
+    expect(second.sent).toHaveLength(1)
+    second.commitNextSend()
+    second.serverMessage({ type: "response.completed", response: { id: "resp_retry" } })
+
+    let text = ""
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      text += new TextDecoder().decode(value)
+    }
+
+    expect(text).toContain("response.completed")
+    expect(MockWebSocket.instances).toHaveLength(2)
+  })
+
+  test("includes websocket send callback errors in retry diagnostics", async () => {
+    vi.useFakeTimers()
+    setWebSocketConstructorForTesting(DeferredSendWebSocket as any)
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "hi", stream: true },
+      false,
+    )
+    const reader = response.body!.getReader()
+
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const ws = MockWebSocket.instances[attempt] as DeferredSendWebSocket
+      expect(ws).toBeDefined()
+      ws.open()
+      ws.commitNextSend(new Error(`write failed ${attempt}`))
+      await Promise.resolve()
+      if (attempt < 5) {
+        vi.advanceTimersByTime(2_000)
+        await Promise.resolve()
+      }
+    }
+
+    await expect(reader.read()).rejects.toThrow(
+      /retry limit reached before response\.create was sent.*reconnectAttempts=5\/5.*lastError="write failed 5"/s,
+    )
+    expect(MockWebSocket.instances).toHaveLength(6)
   })
 
   test("errors after close following streamed data instead of fabricating incomplete", async () => {
@@ -1357,7 +1470,8 @@ describe("websocket bridge", () => {
       expect(received[0].body).toMatchObject({
         type: "response.create",
         model: "gpt-5.5",
-        input: "hi",
+        instructions: "You are a helpful assistant.",
+        input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
         store: false,
         stream: true,
         prompt_cache_key: "prefix_live",

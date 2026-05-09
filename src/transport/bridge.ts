@@ -80,6 +80,8 @@ export function bridgeWebSocket(
       onFinalize: finalize,
       done: false,
       sent: false,
+      writeCommitted: false,
+      framesReceived: false,
       processedAckSent: false,
       idleTimer: null,
       metadata: {},

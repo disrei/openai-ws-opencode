@@ -4,7 +4,7 @@ import WebSocket from "ws"
 
 export type WebSocketLike = {
   readyState: number
-  send(data: string): void
+  send(data: string, callback?: (error?: Error) => void): void
   close(code?: number, reason?: string): void
   terminate?: () => void
   ping?: () => void
@@ -77,9 +77,15 @@ class BunWebSocket extends EventEmitter implements WebSocketLike {
     void this.#connect()
   }
 
-  send(data: string) {
+  send(data: string, callback?: (error?: Error) => void) {
     if (this.readyState !== OPEN || !this.#socket) throw new Error("WebSocket is not open")
-    this.#socket.write(encodeClientFrame(0x1, Buffer.from(data, "utf8")))
+    try {
+      this.#socket.write(encodeClientFrame(0x1, Buffer.from(data, "utf8")))
+      if (callback) queueMicrotask(() => callback())
+    } catch (error) {
+      if (callback) callback(error instanceof Error ? error : new Error(String(error)))
+      else throw error
+    }
   }
 
   ping() {

@@ -26,6 +26,8 @@ export interface PendingRequest {
   onFinalize?: () => void
   done: boolean
   sent: boolean
+  writeCommitted: boolean
+  framesReceived: boolean
   processedAckSent: boolean
   idleTimer: ReturnType<typeof setTimeout> | null
   metadata: PendingMetadata
@@ -263,10 +265,14 @@ function formatFailureMessage(conn: PooledConnection, reason: string): string {
   const code = conn.lastCloseCode !== undefined ? conn.lastCloseCode : "unknown"
   const closeReason = JSON.stringify(conn.lastCloseReason ?? "")
   const lastError = conn.lastErrorMessage ? JSON.stringify(conn.lastErrorMessage) : "none"
+  const pending = conn.pending
+  const responseCreateState = pending
+    ? `; responseCreateSent=${pending.sent}; responseCreateWriteCommitted=${pending.writeCommitted}; responseFramesReceived=${pending.framesReceived}`
+    : ""
   return (
     `WebSocket closed before response completed; cannot retry because ${reason}; ` +
     `reconnectAttempts=${conn.reconnectAttempts}/${transportConfig.maxReconnectAttempts}; ` +
-    `closeCode=${code}; closeReason=${closeReason}; lastError=${lastError}`
+    `closeCode=${code}; closeReason=${closeReason}; lastError=${lastError}${responseCreateState}`
   )
 }
 
@@ -348,6 +354,15 @@ function numberFrom(value: unknown): number | undefined {
   return undefined
 }
 
+function messageFromError(error: unknown): string | undefined {
+  if (error instanceof Error) return error.message
+  if (error && typeof error === "object" && "message" in error) {
+    const message = (error as { message?: unknown }).message
+    if (typeof message === "string" && message) return message
+  }
+  return error !== undefined && error !== null ? String(error) : undefined
+}
+
 function wrappedWebSocketError(frame: Record<string, unknown>): Error | undefined {
   if (frame.type !== "error") return undefined
   const error = frame.error && typeof frame.error === "object" ? (frame.error as Record<string, unknown>) : {}
@@ -379,6 +394,8 @@ function sendResponseProcessed(conn: PooledConnection, pending: PendingRequest, 
 function enqueueSSE(conn: PooledConnection, frame: Record<string, unknown>) {
   const pending = conn.pending
   if (!pending || pending.done) return
+  pending.writeCommitted = true
+  pending.framesReceived = true
   const eventType = typeof frame.type === "string" ? frame.type : "message"
   cacheResponseMetadata(pending, frame)
   const mappedError = wrappedWebSocketError(frame)
@@ -413,17 +430,31 @@ export function sendPending(conn: PooledConnection): boolean {
   if (!pending || pending.done || pending.sent) return false
   const ws = conn.ws
   if (!ws || ws.readyState !== readyState.OPEN) return false
+  const generation = conn.generation
   try {
     const body = { ...pending.body }
     if (body.previous_response_id === undefined && conn.lastResponseID) body.previous_response_id = conn.lastResponseID
-    ws.send(JSON.stringify({ ...body, type: "response.create" }))
+    const payload = JSON.stringify({ ...body, type: "response.create" })
+    pending.sent = true
+    ws.send(payload, (error?: Error) => {
+      if (generation !== conn.generation || conn.pending !== pending || pending.done) return
+      if (error) {
+        pending.sent = false
+        pending.writeCommitted = false
+        conn.lastErrorMessage = messageFromError(error) ?? "websocket send failed"
+        queueMicrotask(() => handleSocketLoss(conn))
+        return
+      }
+      pending.writeCommitted = true
+      schedulePendingIdleTimeout(conn, "response.create")
+    })
   } catch (error) {
-    conn.lastErrorMessage = error instanceof Error ? error.message : String(error)
+    pending.sent = false
+    pending.writeCommitted = false
+    conn.lastErrorMessage = messageFromError(error) ?? "websocket send failed"
     queueMicrotask(() => handleSocketLoss(conn))
     return false
   }
-  pending.sent = true
-  schedulePendingIdleTimeout(conn, "response.create")
   return true
 }
 
@@ -433,6 +464,23 @@ function normalizeCloseReason(reason: unknown): string | undefined {
   if (Buffer.isBuffer(reason)) return reason.toString("utf8")
   if (reason instanceof Uint8Array) return Buffer.from(reason).toString("utf8")
   return String(reason)
+}
+
+function closeCodeFrom(value: unknown): number | undefined {
+  if (typeof value === "number") return value
+  if (value && typeof value === "object") {
+    const code = (value as { code?: unknown }).code
+    if (typeof code === "number") return code
+  }
+  return undefined
+}
+
+function closeReasonFrom(codeOrEvent: unknown, reason: unknown): string | undefined {
+  if (reason !== undefined) return normalizeCloseReason(reason)
+  if (codeOrEvent && typeof codeOrEvent === "object" && "reason" in codeOrEvent) {
+    return normalizeCloseReason((codeOrEvent as { reason?: unknown }).reason)
+  }
+  return undefined
 }
 
 function connect(conn: PooledConnection) {
@@ -480,16 +528,16 @@ function connect(conn: PooledConnection) {
 
   const handleError = (error: unknown) => {
     if (generation !== conn.generation) return
-    conn.lastErrorMessage =
-      error instanceof Error ? error.message : error !== undefined && error !== null ? String(error) : undefined
+    conn.lastErrorMessage = messageFromError(error) ?? "unknown websocket error"
     handleSocketLoss(conn)
   }
 
-  const handleClose = (code?: number, reason?: unknown) => {
+  const handleClose = (codeOrEvent?: unknown, reason?: unknown) => {
     if (generation !== conn.generation) return
-    if (typeof code === "number") conn.lastCloseCode = code
-    const normalizedReason = normalizeCloseReason(reason)
+    conn.lastCloseCode = closeCodeFrom(codeOrEvent) ?? conn.lastCloseCode ?? 1006
+    const normalizedReason = closeReasonFrom(codeOrEvent, reason)
     if (normalizedReason !== undefined) conn.lastCloseReason = normalizedReason
+    else if (conn.lastCloseReason === undefined && closeCodeFrom(codeOrEvent) === undefined) conn.lastCloseReason = "socket closed without close code"
     handleSocketLoss(conn)
   }
 
@@ -528,13 +576,17 @@ function handleSocketLoss(conn: PooledConnection) {
     closeSocket(conn, 1000, "socket lost")
     return
   }
-  if (pending.sent) {
+  if (pending.writeCommitted) {
     fail(conn, new Error(formatFailureMessage(conn, "response.create was already sent")), true)
     return
   }
   const canRetry = conn.reconnectAttempts < transportConfig.maxReconnectAttempts
   if (canRetry) {
     conn.reconnectAttempts++
+    conn.generation++
+    pending.sent = false
+    pending.writeCommitted = false
+    clearPendingTimer(pending)
     const priorWs = conn.ws
     detach(conn)
     try {
@@ -547,7 +599,7 @@ function handleSocketLoss(conn: PooledConnection) {
     conn.retryTimer = unrefTimer(
       setTimeout(() => {
         conn.retryTimer = null
-        if (!connectionPool.includes(conn) || !conn.pending || conn.pending.done || conn.pending.sent) return
+        if (!connectionPool.includes(conn) || !conn.pending || conn.pending.done || conn.pending.sent || conn.pending.writeCommitted) return
         connect(conn)
       }, retryDelay(conn.reconnectAttempts)),
     )

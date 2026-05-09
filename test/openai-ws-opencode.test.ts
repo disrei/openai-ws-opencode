@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url"
 import { describe, expect, test, afterEach, vi } from "vitest"
 import plugin from "../src/index.js"
 import { createBrowserAuthorization } from "../src/auth/oauth.js"
-import { CLIENT_ID, CODEX_OAUTH_SCOPE, CODEX_ORIGINATOR, OAUTH_FALLBACK_PORT, OAUTH_PORT } from "../src/constants.js"
+import { CLIENT_ID, CODEX_OAUTH_SCOPE, CODEX_ORIGINATOR, OAUTH_PORT } from "../src/constants.js"
 import {
   apiKeyWebSocketHeaders,
   bridgeWebSocket,
@@ -118,7 +118,7 @@ describe("oauth authorize URL", () => {
       expect(url.searchParams.get("scope")).toBe(CODEX_OAUTH_SCOPE)
       expect(url.searchParams.get("codex_cli_simplified_flow")).toBe("true")
       expect(url.searchParams.get("id_token_add_organizations")).toBe("true")
-      expect([String(OAUTH_PORT), String(OAUTH_FALLBACK_PORT)]).toContain(redirectUri.port)
+      expect(redirectUri.port).toBe(String(OAUTH_PORT))
       expect(redirectUri.pathname).toBe("/auth/callback")
     } finally {
       oauthTesting.reset()

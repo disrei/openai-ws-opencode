@@ -11,7 +11,6 @@ export const OPENAI_WS_BETA = "responses_websockets=2026-02-06"
 export const CODEX_ORIGINATOR = "opencode"
 export const CODEX_OAUTH_SCOPE = "openid profile email offline_access"
 export const OAUTH_PORT = 1455
-export const OAUTH_FALLBACK_PORT = 1457
 export const DEFAULT_INSTRUCTIONS = "You are a helpful assistant."
 
 export const INTERNAL_SESSION_HEADER = "x-openai-ws-opencode-session-id"

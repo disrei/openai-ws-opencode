@@ -1,6 +1,6 @@
 import http, { type IncomingMessage, type ServerResponse } from "node:http"
 import crypto from "node:crypto"
-import { CLIENT_ID, CODEX_OAUTH_SCOPE, CODEX_ORIGINATOR, ISSUER, OAUTH_FALLBACK_PORT, OAUTH_PORT } from "../constants.js"
+import { CLIENT_ID, CODEX_OAUTH_SCOPE, CODEX_ORIGINATOR, ISSUER, OAUTH_PORT } from "../constants.js"
 import { exchangeCodeForTokens, extractAccountId, tokenExpiry, type TokenResponse } from "./tokens.js"
 
 type PendingOAuth = {
@@ -114,27 +114,21 @@ async function startOAuthServer(): Promise<string> {
   })
   oauthServer = server
 
-  let port: number
   try {
-    port = await listen(server, OAUTH_PORT)
+    await listen(server, OAUTH_PORT)
   } catch (error) {
-    if (!isAddressInUse(error)) {
-      oauthServer = undefined
-      throw error
-    }
-    try {
-      port = await listen(server, OAUTH_FALLBACK_PORT)
-    } catch (fallbackError) {
-      oauthServer = undefined
-      throw fallbackError
-    }
+    oauthServer = undefined
+    oauthRedirectUri = undefined
+    server.close()
+    if (isAddressInUse(error)) throw new Error(`OpenAI WebSocket OAuth requires localhost:${OAUTH_PORT}; stop the process using that port and retry.`)
+    throw error
   }
 
-  oauthRedirectUri = `http://localhost:${port}/auth/callback`
+  oauthRedirectUri = `http://localhost:${OAUTH_PORT}/auth/callback`
   return oauthRedirectUri
 }
 
-function listen(server: http.Server, port: number): Promise<number> {
+function listen(server: http.Server, port: number): Promise<void> {
   return new Promise((resolve, reject) => {
     const onError = (error: Error) => {
       server.off("listening", onListening)
@@ -142,7 +136,7 @@ function listen(server: http.Server, port: number): Promise<number> {
     }
     const onListening = () => {
       server.off("error", onError)
-      resolve(port)
+      resolve()
     }
     server.once("error", onError)
     server.once("listening", onListening)
@@ -205,7 +199,7 @@ export async function createBrowserAuthorization() {
 export async function createDeviceAuthorization() {
   const deviceResponse = await fetch(`${ISSUER}/api/accounts/deviceauth/usercode`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "User-Agent": "openai-ws-opencode/0.1.3" },
+    headers: { "Content-Type": "application/json", "User-Agent": "openai-ws-opencode/0.1.4" },
     body: JSON.stringify({ client_id: CLIENT_ID }),
   })
   if (!deviceResponse.ok) throw new Error("Failed to initiate device authorization")
@@ -224,7 +218,7 @@ export async function createDeviceAuthorization() {
       for (;;) {
         const response = await fetch(`${ISSUER}/api/accounts/deviceauth/token`, {
           method: "POST",
-          headers: { "Content-Type": "application/json", "User-Agent": "openai-ws-opencode/0.1.3" },
+          headers: { "Content-Type": "application/json", "User-Agent": "openai-ws-opencode/0.1.4" },
           body: JSON.stringify({
             device_auth_id: deviceData.device_auth_id,
             user_code: deviceData.user_code,

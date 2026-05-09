@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 import { existsSync } from "node:fs"
 import { copyFile, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises"
+import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
@@ -12,6 +13,10 @@ const model = process.env.OPENAI_WS_LIVE_MODEL ?? "openai-ws/gpt-5.4-mini"
 const agent = process.env.OPENAI_WS_LIVE_AGENT
 const streamStartTimeoutMs = numberEnv("OPENAI_WS_LIVE_STREAM_START_MS", 3_000)
 const turnTimeoutMs = numberEnv("OPENAI_WS_LIVE_TURN_TIMEOUT_MS", 60_000)
+const abortCloseTimeoutMs = numberEnv("OPENAI_WS_LIVE_ABORT_CLOSE_MS", 10_000)
+const largeContextChars = numberEnv("OPENAI_WS_LIVE_LARGE_CHARS", 32_000)
+const serverStartTimeoutMs = numberEnv("OPENAI_WS_LIVE_SERVER_START_MS", 15_000)
+const compactTimeoutMs = numberEnv("OPENAI_WS_LIVE_COMPACT_TIMEOUT_MS", 90_000)
 const requireAuth = process.env.OPENAI_WS_LIVE === "1" || process.env.OPENAI_WS_LIVE_REQUIRED === "1"
 const keepArtifacts = process.env.OPENAI_WS_LIVE_KEEP_ARTIFACTS === "1"
 let opencodeEnv: NodeJS.ProcessEnv = {}
@@ -27,6 +32,7 @@ type LiveRunResult = CommandResult & {
   events: unknown[]
   assistantText: string
   sawTool: boolean
+  streamStarted: boolean
 }
 
 function numberEnv(name: string, fallback: number): number {
@@ -173,6 +179,21 @@ function terminate(child: ChildProcessWithoutNullStreams) {
   killTimer.unref?.()
 }
 
+function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer()
+    server.unref()
+    server.on("error", reject)
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address()
+      server.close((error) => {
+        if (error) reject(error)
+        else resolve(typeof address === "object" && address ? address.port : 0)
+      })
+    })
+  })
+}
+
 async function runChecked(command: string, args: string[], options: { cwd: string; timeoutMs: number; env?: NodeJS.ProcessEnv }) {
   const result = await spawnCommand(command, args, options)
   if (result.code !== 0) {
@@ -217,9 +238,18 @@ function eventType(value: unknown): string {
   return typeof type === "string" ? type : ""
 }
 
+function eventString(value: unknown, path: string): string | undefined {
+  if (!value || typeof value !== "object") return undefined
+  let current: unknown = value
+  for (const key of path.split(".")) {
+    if (!current || typeof current !== "object") return undefined
+    current = (current as Record<string, unknown>)[key]
+  }
+  return typeof current === "string" ? current : undefined
+}
+
 function isStreamingSignal(value: unknown, raw = ""): boolean {
   const type = eventType(value)
-  if (/step[_-]start/i.test(type)) return true
   if (/response\..*\.delta|message\.part|assistant|tool/i.test(type)) return true
   if (/response\.(output_text\.delta|output_item\.done|function_call)|message\.part|assistant/i.test(raw)) return true
   if (!value || typeof value !== "object") return false
@@ -262,9 +292,110 @@ function collectAssistantText(events: unknown[]): string {
   return chunks.join("")
 }
 
+function sessionIDFromEvents(events: unknown[]): string | undefined {
+  for (const event of events) {
+    const candidate =
+      eventString(event, "sessionID") ??
+      eventString(event, "session.id") ??
+      eventString(event, "part.sessionID") ??
+      eventString(event, "properties.sessionID")
+    if (candidate?.startsWith("ses_")) return candidate
+  }
+  return undefined
+}
+
+function eventIndex(events: unknown[], pattern: RegExp): number {
+  return events.findIndex((event) => pattern.test(eventType(event)))
+}
+
+function assertRuntimeTurn(result: LiveRunResult, label: string) {
+  if (result.code !== 0) throw new Error(`${label} exited with code ${result.code ?? result.signal}`)
+  if (/NpmInstallFailedError|failed to install plugin/i.test(result.stderr)) {
+    throw new Error(`${label} did not load the local plugin package cleanly\n${redact(tail(result.stderr))}`)
+  }
+  if (!/service=plugin\b.*path=openai-ws-opencode@file:/i.test(result.stderr)) {
+    throw new Error(`${label} did not load the packed local openai-ws-opencode plugin\n${redact(tail(result.stderr))}`)
+  }
+  if (!result.streamStarted) {
+    throw new Error(`${label} exited successfully but no OpenAI stream event was observed\n${redact(tail(result.stderr || result.stdout))}`)
+  }
+
+  const startIndex = eventIndex(result.events, /step[_-]start|text|message\.part|response\..*\.delta|response\.output_item\.done/i)
+  const finishIndex = eventIndex(result.events, /step[_-]finish|response\.completed/i)
+  const sawIdle = /service=bus type=session\.idle publishing|service=session\.prompt .*exiting loop/i.test(result.stderr)
+  if (finishIndex < 0 && !sawIdle) {
+    throw new Error(`${label} did not emit a terminal step/response event\n${redact(tail(result.stdout || result.stderr))}`)
+  }
+  if (finishIndex >= 0 && startIndex >= 0 && startIndex > finishIndex) {
+    throw new Error(`${label} terminal event arrived before any streaming event\n${redact(tail(result.stdout || result.stderr))}`)
+  }
+}
+
 async function writeArtifacts(dir: string, name: string, result: Pick<CommandResult, "stdout" | "stderr">) {
   await writeFile(path.join(dir, `${name}.stdout.log`), redact(result.stdout), "utf8")
   await writeFile(path.join(dir, `${name}.stderr.log`), redact(result.stderr), "utf8")
+}
+
+async function startOpenCodeServer(
+  name: string,
+  projectDir: string,
+  artifactsDir: string,
+): Promise<{ url: string; stop: () => Promise<CommandResult> }> {
+  const port = await freePort()
+  if (!port) throw new Error("could not allocate a local OpenCode server port")
+  const url = `http://127.0.0.1:${port}`
+  const child = spawn(opencodeBin, ["serve", "--hostname", "127.0.0.1", "--port", String(port), "--print-logs", "--log-level", "DEBUG"], {
+    cwd: projectDir,
+    env: { ...process.env, ...opencodeEnv },
+    stdio: ["ignore", "pipe", "pipe"],
+  })
+  let stdout = ""
+  let stderr = ""
+  let stopped = false
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk.toString("utf8")
+  })
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk.toString("utf8")
+  })
+
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < serverStartTimeoutMs) {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      await writeArtifacts(artifactsDir, `${name}-server`, { stdout, stderr })
+      throw new Error(`${name} server exited before it was ready\n${redact(tail(stderr || stdout))}`)
+    }
+    try {
+      const response = await fetch(`${url}/config`)
+      if (response.ok) break
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+
+  try {
+    const response = await fetch(`${url}/config`)
+    if (!response.ok) throw new Error(`GET /config returned ${response.status}`)
+  } catch (error) {
+    terminate(child)
+    await writeArtifacts(artifactsDir, `${name}-server`, { stdout, stderr })
+    throw new Error(`${name} server did not become ready: ${error instanceof Error ? error.message : String(error)}`)
+  }
+
+  return {
+    url,
+    stop: () =>
+      new Promise((resolve) => {
+        if (stopped) {
+          resolve({ stdout, stderr, code: child.exitCode, signal: child.signalCode })
+          return
+        }
+        stopped = true
+        child.once("close", (code, signal) => {
+          void writeArtifacts(artifactsDir, `${name}-server`, { stdout, stderr }).then(() => resolve({ stdout, stderr, code, signal }))
+        })
+        terminate(child)
+      }),
+  }
 }
 
 async function runLiveTurn(
@@ -301,6 +432,7 @@ async function runLiveTurn(
     let stderr = ""
     let lineBuffer = ""
     let streamStarted = false
+    let llmStreamBoundarySeen = false
     let settled = false
     const events: unknown[] = []
     let sawTool = false
@@ -317,6 +449,7 @@ async function runLiveTurn(
     }
 
     const startStreamTimer = () => {
+      llmStreamBoundarySeen = true
       if (streamTimer || streamStarted) return
       streamTimer = setTimeout(() => {
         void finishReject(
@@ -361,8 +494,10 @@ async function runLiveTurn(
     child.stderr.on("data", (chunk) => {
       const text = chunk.toString("utf8")
       stderr += text
-      if (/service=llm\b.*providerID=openai-ws\b.*\bstream\b/i.test(text)) startStreamTimer()
-      if (/response\.(created|completed|output_text\.delta|output_item|function_call)|message\.part\.delta/i.test(text)) markStreaming()
+      if (/service=llm\b.*providerID=openai-ws\b.*small=false\b.*\bstream\b/i.test(text)) startStreamTimer()
+      if (llmStreamBoundarySeen && /response\.(created|completed|output_text\.delta|output_item|function_call)|message\.part\.(updated|delta)/i.test(text)) {
+        markStreaming()
+      }
       if (/\b(tool|tool_call|function_call)\b/i.test(text)) sawTool = true
     })
     child.on("error", (error) => {
@@ -381,6 +516,7 @@ async function runLiveTurn(
         signal,
         events,
         sawTool,
+        streamStarted,
         assistantText: collectAssistantText(events),
       }
       void writeArtifacts(artifactsDir, name, result).then(() => {
@@ -394,10 +530,189 @@ async function runLiveTurn(
   })
 }
 
-function assertIncludes(result: LiveRunResult, expected: string, label: string) {
+async function runAbortTurn(name: string, prompt: string, projectDir: string, artifactsDir: string): Promise<LiveRunResult> {
+  const args = [
+    "run",
+    "--format",
+    "json",
+    "--print-logs",
+    "--log-level",
+    "DEBUG",
+    "--model",
+    model,
+    "--dangerously-skip-permissions",
+    "--dir",
+    projectDir,
+    ...(agent ? ["--agent", agent] : []),
+    prompt,
+  ]
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(opencodeBin, args, {
+      cwd: projectDir,
+      env: { ...process.env, ...opencodeEnv },
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+    let stdout = ""
+    let stderr = ""
+    let lineBuffer = ""
+    const events: unknown[] = []
+    let sawTool = false
+    let streamTimer: ReturnType<typeof setTimeout> | undefined
+    let closeTimer: ReturnType<typeof setTimeout> | undefined
+    let settled = false
+    let streamStarted = false
+    let llmStreamBoundarySeen = false
+
+    const cleanup = () => {
+      if (streamTimer) clearTimeout(streamTimer)
+      if (closeTimer) clearTimeout(closeTimer)
+      clearTimeout(overallTimer)
+    }
+
+    const fail = async (error: Error) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      terminate(child)
+      await writeArtifacts(artifactsDir, name, { stdout, stderr })
+      reject(error)
+    }
+
+    const markStreaming = () => {
+      if (streamStarted) return
+      streamStarted = true
+      if (streamTimer) clearTimeout(streamTimer)
+      terminate(child)
+      closeTimer = setTimeout(() => {
+        void fail(new Error(`${name} streamed but did not close within ${abortCloseTimeoutMs}ms after abort`))
+      }, abortCloseTimeoutMs)
+      closeTimer.unref?.()
+    }
+
+    const startStreamTimer = () => {
+      llmStreamBoundarySeen = true
+      if (streamTimer || streamStarted) return
+      streamTimer = setTimeout(() => {
+        void fail(new Error(`${name} did not start streaming from ${model} within ${streamStartTimeoutMs}ms\n${redact(tail(stderr || stdout))}`))
+      }, streamStartTimeoutMs)
+      streamTimer.unref?.()
+    }
+
+    const processLine = (line: string) => {
+      const parsed = tryParseJson(line)
+      if (parsed !== undefined) {
+        events.push(parsed)
+        if (hasToolSignal(parsed)) sawTool = true
+        if (isStreamingSignal(parsed, line)) markStreaming()
+      } else if (isStreamingSignal(undefined, line)) {
+        markStreaming()
+      }
+    }
+
+    const overallTimer = setTimeout(() => {
+      void fail(new Error(`${name} did not reach the LLM stream boundary within ${turnTimeoutMs}ms\n${redact(tail(stderr || stdout))}`))
+    }, turnTimeoutMs)
+    overallTimer.unref?.()
+
+    child.stdout.on("data", (chunk) => {
+      const text = chunk.toString("utf8")
+      stdout += text
+      lineBuffer += text
+      const lines = lineBuffer.split(/\r?\n/)
+      lineBuffer = lines.pop() ?? ""
+      for (const line of lines) processLine(line)
+    })
+    child.stderr.on("data", (chunk) => {
+      const text = chunk.toString("utf8")
+      stderr += text
+      if (/service=llm\b.*providerID=openai-ws\b.*small=false\b.*\bstream\b/i.test(text)) startStreamTimer()
+      if (llmStreamBoundarySeen && /response\.(output_text\.delta|function_call)|message\.part\.delta/i.test(text)) {
+        markStreaming()
+      }
+    })
+    child.on("error", (error) => {
+      void fail(error)
+    })
+    child.on("close", (code, signal) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      if (lineBuffer.trim()) processLine(lineBuffer)
+      const result = {
+        stdout,
+        stderr,
+        code,
+        signal,
+        events,
+        sawTool,
+        streamStarted,
+        assistantText: collectAssistantText(events),
+      }
+      void writeArtifacts(artifactsDir, name, result).then(() => {
+        if (!streamStarted) {
+          reject(new Error(`${name} exited before stream start with code ${code ?? signal}\n${redact(tail(stderr || stdout))}`))
+          return
+        }
+        resolve(result)
+      }, reject)
+    })
+  })
+}
+
+function safeArtifactName(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")
+}
+
+async function assertIncludes(result: LiveRunResult, expected: string, label: string, projectDir: string, artifactsDir: string) {
   const haystack = `${result.assistantText}\n${result.stdout}`
-  if (!haystack.includes(expected)) {
-    throw new Error(`${label} did not include ${expected}\n${redact(tail(result.stdout || result.stderr))}`)
+  if (haystack.includes(expected)) return
+
+  const sessionID = sessionIDFromEvents(result.events)
+  if (sessionID) {
+    const exported = await spawnCommand(opencodeBin, ["export", sessionID], {
+      cwd: projectDir,
+      timeoutMs: 30_000,
+      env: opencodeEnv,
+    })
+    await writeArtifacts(artifactsDir, `${safeArtifactName(label)}-export`, exported)
+    if (`${exported.stdout}\n${exported.stderr}`.includes(expected)) return
+  }
+
+  throw new Error(`${label} did not include ${expected}\n${redact(tail(result.stdout || result.stderr))}`)
+}
+
+function largeContextPrompt(expected: string): string {
+  const filler = "context-block ".repeat(Math.ceil(largeContextChars / "context-block ".length)).slice(0, largeContextChars)
+  return [
+    "Read the full prompt and preserve the final nonce exactly.",
+    filler,
+    `Final nonce: ${expected}`,
+    `Reply exactly ${expected} and nothing else.`,
+  ].join("\n")
+}
+
+async function compactSession(serverUrl: string, sessionID: string, projectDir: string, artifactsDir: string) {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), compactTimeoutMs)
+  try {
+    const response = await fetch(`${serverUrl}/session/${sessionID}/summarize?directory=${encodeURIComponent(projectDir)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({ providerID: "openai-ws", modelID: model.replace(/^openai-ws\//, "") }),
+      signal: controller.signal,
+    })
+    const text = await response.text()
+    await writeArtifacts(artifactsDir, "compact-session", {
+      stdout: text,
+      stderr: `POST /session/${sessionID}/summarize -> ${response.status}`,
+    })
+    if (/text\/html/i.test(response.headers.get("content-type") ?? "")) {
+      throw new Error(`compact hit the web UI fallback instead of the session API: ${response.status}`)
+    }
+    if (!response.ok) throw new Error(`compact returned ${response.status}: ${redact(tail(text))}`)
+  } finally {
+    clearTimeout(timeout)
   }
 }
 
@@ -428,11 +743,10 @@ async function main() {
     opencodeEnv = await prepareOpenCodeSandbox(tmpDir)
     const tarball = await packLocalPlugin(tmpDir)
     const configPath = path.join(projectDir, "opencode.json")
-    await runChecked(
-      "node",
-      ["bin/setup.js", "--path", configPath, "--plugin", `file:${tarball}`, "--no-cache-repair"],
-      { cwd: repoRoot, timeoutMs: 30_000 },
-    )
+    await runChecked("node", ["bin/setup.js", "--path", configPath, "--plugin", `openai-ws-opencode@file:${tarball}`, "--no-cache-repair"], {
+      cwd: repoRoot,
+      timeoutMs: 30_000,
+    })
     opencodeEnv.OPENCODE_CONFIG = configPath
 
     const auth = await spawnCommand(opencodeBin, ["auth", "list"], { cwd: projectDir, timeoutMs: 30_000, env: opencodeEnv })
@@ -447,7 +761,8 @@ async function main() {
 
     const basicNonce = nonce("BASIC_OK")
     const basic = await runLiveTurn("basic-response", `Reply exactly ${basicNonce} and nothing else.`, projectDir, artifactsDir)
-    assertIncludes(basic, basicNonce, "basic response")
+    assertRuntimeTurn(basic, "basic response")
+    await assertIncludes(basic, basicNonce, "basic response", projectDir, artifactsDir)
 
     const toolNonce = nonce("TOOL_OK")
     const toolFile = path.join(projectDir, "live-tool-nonce.txt")
@@ -458,7 +773,8 @@ async function main() {
       projectDir,
       artifactsDir,
     )
-    assertIncludes(tool, toolNonce, "tool response")
+    assertRuntimeTurn(tool, "tool response")
+    await assertIncludes(tool, toolNonce, "tool response", projectDir, artifactsDir)
     if (!tool.sawTool) throw new Error(`tool-use completed but no tool activity was observed\n${redact(tail(tool.stdout || tool.stderr))}`)
 
     const continueNonce = nonce("CONT")
@@ -468,7 +784,8 @@ async function main() {
       projectDir,
       artifactsDir,
     )
-    assertIncludes(first, "FIRST_OK", "first continuation response")
+    assertRuntimeTurn(first, "first continuation response")
+    await assertIncludes(first, "FIRST_OK", "first continuation response", projectDir, artifactsDir)
 
     const second = await runLiveTurn(
       "continue-second",
@@ -477,7 +794,83 @@ async function main() {
       artifactsDir,
       ["--continue"],
     )
-    assertIncludes(second, continueNonce, "continued response")
+    assertRuntimeTurn(second, "continued response")
+    await assertIncludes(second, continueNonce, "continued response", projectDir, artifactsDir)
+
+    const resumeNonce = nonce("RESUME")
+    const resumeFirst = await runLiveTurn(
+      "resume-first",
+      `Remember this resume nonce for the next message: ${resumeNonce}. Reply exactly RESUME_READY and nothing else.`,
+      projectDir,
+      artifactsDir,
+    )
+    assertRuntimeTurn(resumeFirst, "resume first response")
+    await assertIncludes(resumeFirst, "RESUME_READY", "resume first response", projectDir, artifactsDir)
+    const sessionID = sessionIDFromEvents(resumeFirst.events)
+    if (!sessionID) throw new Error(`resume-first completed but no session id was emitted\n${redact(tail(resumeFirst.stdout || resumeFirst.stderr))}`)
+
+    const resumeSecond = await runLiveTurn(
+      "resume-second",
+      "Using only the existing session memory, reply exactly with the resume nonce and nothing else.",
+      projectDir,
+      artifactsDir,
+      ["--session", sessionID],
+    )
+    assertRuntimeTurn(resumeSecond, "resumed response")
+    await assertIncludes(resumeSecond, resumeNonce, "resumed response", projectDir, artifactsDir)
+
+    const compactNonce = nonce("COMPACT")
+    const compactFirst = await runLiveTurn(
+      "compact-first",
+      `Remember this compact nonce for after compaction: ${compactNonce}. Reply exactly COMPACT_READY and nothing else.`,
+      projectDir,
+      artifactsDir,
+    )
+    assertRuntimeTurn(compactFirst, "compact first response")
+    await assertIncludes(compactFirst, "COMPACT_READY", "compact first response", projectDir, artifactsDir)
+    const compactSessionID = sessionIDFromEvents(compactFirst.events)
+    if (!compactSessionID) {
+      throw new Error(`compact-first completed but no session id was emitted\n${redact(tail(compactFirst.stdout || compactFirst.stderr))}`)
+    }
+
+    const compactServer = await startOpenCodeServer("compact", projectDir, artifactsDir)
+    try {
+      await compactSession(compactServer.url, compactSessionID, projectDir, artifactsDir)
+      const compactSecond = await runLiveTurn(
+        "compact-second",
+        "Using only the compacted session, reply exactly with the compact nonce and nothing else.",
+        projectDir,
+        artifactsDir,
+        ["--session", compactSessionID],
+      )
+      assertRuntimeTurn(compactSecond, "compacted session response")
+      await assertIncludes(compactSecond, compactNonce, "compacted session response", projectDir, artifactsDir)
+    } finally {
+      await compactServer.stop()
+    }
+
+    const abort = await runAbortTurn(
+      "abort-after-stream",
+      "Begin a long answer by counting upward with one number per short sentence. Keep going until stopped.",
+      projectDir,
+      artifactsDir,
+    )
+    if (!abort.streamStarted) throw new Error("abort-after-stream closed before any stream evidence was observed")
+
+    const recoveryNonce = nonce("RECOVERY")
+    const recovery = await runLiveTurn(
+      "post-abort-recovery",
+      `Reply exactly ${recoveryNonce} and nothing else.`,
+      projectDir,
+      artifactsDir,
+    )
+    assertRuntimeTurn(recovery, "post-abort recovery response")
+    await assertIncludes(recovery, recoveryNonce, "post-abort recovery response", projectDir, artifactsDir)
+
+    const largeNonce = nonce("LARGE")
+    const large = await runLiveTurn("large-context", largeContextPrompt(largeNonce), projectDir, artifactsDir)
+    assertRuntimeTurn(large, "large context response")
+    await assertIncludes(large, largeNonce, "large context response", projectDir, artifactsDir)
 
     success = true
     console.log(`Live OpenCode harness passed with ${model}.`)

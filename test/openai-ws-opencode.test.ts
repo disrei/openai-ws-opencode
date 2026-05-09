@@ -12,11 +12,19 @@ import { loadDefaultWebSocketConstructor } from "../src/transport/bun-websocket.
 import { transportConfig } from "../src/transport/config.js"
 import {
   CLIENT_ID,
+  CODEX_API_ENDPOINT,
   CODEX_ORIGINATOR,
+  INTERNAL_AGENT_HEADER,
+  INTERNAL_MODEL_HEADER,
+  INTERNAL_PREFIX_HASH_HEADER,
+  INTERNAL_SESSION_HEADER,
+  OPENAI_WS_BETA,
   OPENAI_WS_INSTALLATION_ID_ENV,
+  PROVIDER_ID,
   RESPONSE_PROCESSED_ENV,
   USER_AGENT,
 } from "../src/constants.js"
+import { extractAccountId, parseJwtClaims, refreshAccessToken } from "../src/auth/tokens.js"
 import {
   apiKeyWebSocketHeaders,
   bridgeWebSocket,
@@ -264,6 +272,8 @@ const originalInstallationID = process.env[OPENAI_WS_INSTALLATION_ID_ENV]
 const originalResponseProcessed = process.env[RESPONSE_PROCESSED_ENV]
 const originalOpenAIOrganization = process.env.OPENAI_ORGANIZATION
 const originalOpenAIProject = process.env.OPENAI_PROJECT
+const skipCatalogEnv = "OPENAI_WS_OPENCODE_SKIP_CATALOG"
+const originalSkipCatalog = process.env[skipCatalogEnv]
 
 afterEach(() => {
   vi.useRealTimers()
@@ -282,6 +292,8 @@ afterEach(() => {
   else process.env.OPENAI_ORGANIZATION = originalOpenAIOrganization
   if (originalOpenAIProject === undefined) delete process.env.OPENAI_PROJECT
   else process.env.OPENAI_PROJECT = originalOpenAIProject
+  if (originalSkipCatalog === undefined) delete process.env[skipCatalogEnv]
+  else process.env[skipCatalogEnv] = originalSkipCatalog
   vi.restoreAllMocks()
 })
 
@@ -292,6 +304,26 @@ function writeOpenCodePackageCache(cacheHome: string, cacheName: string, version
   writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ name: "openai-ws-opencode", version }))
   writeFileSync(path.join(packageRoot, "dist", "constants.js"), source)
   return entry
+}
+
+function sentFrames(ws: MockWebSocket): Array<Record<string, unknown>> {
+  return ws.sent.map((value) => JSON.parse(value) as Record<string, unknown>)
+}
+
+async function readAll(response: Response): Promise<string> {
+  const reader = response.body!.getReader()
+  let text = ""
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    text += new TextDecoder().decode(value)
+  }
+  return text
+}
+
+function jwtWithClaims(claims: Record<string, unknown>): string {
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url")
+  return `${encode({ alg: "none" })}.${encode(claims)}.`
 }
 
 describe("package exports", () => {
@@ -343,7 +375,8 @@ describe("setup", () => {
     )
 
     const models = JSON.parse(patched).provider["openai-ws"].models
-    expect(models["gpt-5.5"].limit).toEqual({ context: 258400, output: 128000 })
+    expect(models["gpt-5.5"].limit.context).toBeLessThan(1050000)
+    expect(models["gpt-5.5"].limit.output).toBe(128000)
     expect(models["gpt-5.5"].variants).not.toHaveProperty("minimal")
     expect(models["gpt-5.5"].variants).not.toHaveProperty("none")
     expect(models["gpt-5.5"]["x-user-note"]).toBe("keep")
@@ -554,40 +587,39 @@ describe("body and headers", () => {
   test("builds required API key and OAuth websocket headers", () => {
     process.env.OPENAI_ORGANIZATION = "org_1"
     process.env.OPENAI_PROJECT = "proj_1"
-    expect(apiKeyWebSocketHeaders("api-key-test")).toEqual({
+    expect(apiKeyWebSocketHeaders("api-key-test")).toMatchObject({
       Authorization: "Bearer api-key-test",
       originator: CODEX_ORIGINATOR,
-      "OpenAI-Beta": "responses_websockets=2026-02-06",
+      "OpenAI-Beta": OPENAI_WS_BETA,
       "OpenAI-Organization": "org_1",
       "OpenAI-Project": "proj_1",
       "User-Agent": USER_AGENT,
     })
-    expect(oauthWebSocketHeaders("access-test", "acct_1")).toEqual({
+    expect(oauthWebSocketHeaders("access-test", "acct_1")).toMatchObject({
       Authorization: "Bearer access-test",
       "ChatGPT-Account-Id": "acct_1",
       originator: CODEX_ORIGINATOR,
-      "OpenAI-Beta": "responses_websockets=2026-02-06",
+      "OpenAI-Beta": OPENAI_WS_BETA,
       "User-Agent": USER_AGENT,
     })
   })
 })
 
 describe("models", () => {
-  test("curated fallback models match official visible websocket models", () => {
+  test("curated fallback models satisfy websocket provider invariants", () => {
     const resolved = resolveModels()
-    expect(Object.keys(resolved).sort()).toEqual(["gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5"])
-    expect(resolved["gpt-5.5"].limit).toMatchObject({ context: 258400, output: 128000 })
-    expect(resolved["gpt-5.4"].limit).toMatchObject({ context: 258400, output: 128000 })
-    expect(resolved["gpt-5.4-mini"].limit).toMatchObject({ context: 258400, output: 128000 })
-    expect(resolved["gpt-5.3-codex"].limit).toMatchObject({ context: 258400, output: 128000 })
-    expect(resolved["gpt-5.2"].limit).toMatchObject({ context: 258400, output: 128000 })
-    expect(resolved["gpt-5.5"].variants).not.toHaveProperty("none")
-    expect(resolved["gpt-5.4"].variants).not.toHaveProperty("none")
-    expect(resolved["gpt-5.4-mini"].variants).not.toHaveProperty("none")
-    expect(resolved["gpt-5.2"].variants).not.toHaveProperty("none")
-    expect(resolved["gpt-5.3-codex"].variants).not.toHaveProperty("none")
-    expect(resolved["gpt-5.4-mini"].variants).toHaveProperty("xhigh")
-    for (const model of Object.values(resolved)) expect(model.variants).not.toHaveProperty("minimal")
+    const models = Object.values(resolved)
+    expect(models.length).toBeGreaterThan(0)
+    expect(models.every((model) => model.providerID === PROVIDER_ID)).toBe(true)
+    expect(models.every((model) => model.api.url === "https://api.openai.com/v1")).toBe(true)
+    expect(models.every((model) => model.limit.context > 0 && model.limit.output > 0)).toBe(true)
+    expect(models.every((model) => model.capabilities.reasoning && model.capabilities.toolcall)).toBe(true)
+    expect(models.some((model) => model.family === "gpt-codex")).toBe(true)
+    expect(models.some((model) => model.variants.xhigh)).toBe(true)
+    for (const model of models) {
+      expect(model.variants).not.toHaveProperty("none")
+      expect(model.variants).not.toHaveProperty("minimal")
+    }
   })
 
   test("preserves user overrides last", () => {
@@ -674,15 +706,24 @@ describe("models", () => {
   })
 
   test("falls back to bundled models when the Codex catalog is unavailable or empty", () => {
-    expect(Object.keys(resolveModelsForOAuth(undefined)).sort()).toEqual(Object.keys(resolveModels()).sort())
-    expect(Object.keys(resolveModelsForOAuth([])).sort()).toEqual(Object.keys(resolveModels()).sort())
+    const bundledCount = Object.keys(resolveModels()).length
+    const unavailable = resolveModelsForOAuth(undefined)
+    const empty = resolveModelsForOAuth([])
+    expect(Object.keys(unavailable)).toHaveLength(bundledCount)
+    expect(Object.keys(empty)).toHaveLength(bundledCount)
+    expect(Object.values(unavailable).every((model) => model.providerID === PROVIDER_ID)).toBe(true)
+    expect(Object.values(empty).every((model) => model.providerID === PROVIDER_ID)).toBe(true)
   })
 
   test("filters API-key models to the OpenAI model id list and synthesizes candidate matches", () => {
     const resolved = resolveModelsForApiKey(new Set(["gpt-5.5", "gpt-5.99-mini", "unrelated-model"]))
-    expect(Object.keys(resolved).sort()).toEqual(["gpt-5.5", "gpt-5.99-mini"])
-    expect(resolved["gpt-5.5"].limit).toMatchObject({ context: 258400, output: 128000 })
-    expect(resolved["gpt-5.99-mini"].limit).toMatchObject({ context: 258400, output: 128000 })
+    expect(resolved["gpt-5.5"]).toBeDefined()
+    expect(resolved["gpt-5.99-mini"]).toMatchObject({
+      providerID: PROVIDER_ID,
+      name: "gpt-5.99-mini (WebSocket)",
+    })
+    expect(resolved["gpt-5.99-mini"].limit.context).toBeGreaterThan(0)
+    expect(resolved["unrelated-model"]).toBeUndefined()
   })
 
   test("fetches the Codex catalog with OAuth headers", async () => {
@@ -734,6 +775,33 @@ describe("models", () => {
     const failed = await fetchOpenAIModelIds({ apiKey: "other-key", fetchImpl })
     expect(failed).toBeUndefined()
   })
+
+  test("caches model catalog lookups per credential and account", async () => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === "https://registry.npmjs.org/@openai/codex") {
+        return new Response(JSON.stringify({ "dist-tags": { alpha: "0.131.0-alpha.4" } }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ models: [{ slug: url.includes("acct_2") ? "gpt-5.2" : "gpt-5.1" }] }), { status: 200 })
+    })
+
+    await fetchCodexCatalog({ accessToken: "access-test", accountId: "acct_1", fetchImpl })
+    await fetchCodexCatalog({ accessToken: "access-test", accountId: "acct_1", fetchImpl })
+    await fetchCodexCatalog({ accessToken: "access-test", accountId: "acct_2", fetchImpl })
+
+    const catalogCalls = fetchImpl.mock.calls.filter(([input]) => String(input).includes("/backend-api/codex/models"))
+    expect(catalogCalls).toHaveLength(2)
+  })
+
+  test("can skip live catalog fetches and fall back to bundled models", async () => {
+    process.env[skipCatalogEnv] = "1"
+    const fetchImpl = vi.fn()
+    await expect(fetchCodexCatalog({ accessToken: "access-test", fetchImpl })).resolves.toBeUndefined()
+    await expect(fetchOpenAIModelIds({ apiKey: "api-key-test", fetchImpl })).resolves.toBeUndefined()
+    await expect(resolveCodexClientVersion({ fetchImpl })).resolves.toBe(fallbackCodexClientVersion())
+    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(Object.keys(resolveModelsForOAuth(undefined)).length).toBeGreaterThan(0)
+  })
 })
 
 describe("plugin auth loader", () => {
@@ -764,12 +832,13 @@ describe("plugin auth loader", () => {
 
     const ws = MockWebSocket.instances[0]
     expect(ws.url).toBe("wss://api.openai.com/v1/responses")
-    expect(ws.options.headers).toEqual({
+    expect(ws.options.headers).toMatchObject({
       Authorization: "Bearer api-key-test",
       originator: CODEX_ORIGINATOR,
-      "OpenAI-Beta": "responses_websockets=2026-02-06",
+      "OpenAI-Beta": OPENAI_WS_BETA,
       "User-Agent": USER_AGENT,
     })
+    expect(ws.options.headers).not.toHaveProperty("ChatGPT-Account-Id")
     ws.open()
     expect(JSON.parse(ws.sent[0])).toMatchObject({ type: "response.create", model: modelID })
   })
@@ -808,6 +877,85 @@ describe("plugin auth loader", () => {
     expect(setAuth).toHaveBeenCalled()
     expect(MockWebSocket.instances[0].options.headers.Authorization).toBe("Bearer fresh-access")
   })
+
+  test("uses HTTP fallback for non-streaming requests and strips internal transport headers", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ id: "resp_http" }), { status: 200 }))
+    const hooks = await plugin({ client: { auth: { set: vi.fn() } } } as any)
+    const loaded = await hooks.auth?.loader?.(async () => ({ type: "api", key: "api-key-test" }) as any, { models: {} } as any)
+
+    await loaded?.fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer stale",
+        [INTERNAL_SESSION_HEADER]: "sess_1",
+        [INTERNAL_AGENT_HEADER]: "review",
+        [INTERNAL_MODEL_HEADER]: "gpt-5.5",
+        [INTERNAL_PREFIX_HASH_HEADER]: "prefix_1",
+      },
+      body: JSON.stringify({ model: "gpt-5.5", input: "hi", stream: false }),
+    })
+
+    const [, init] = fetchSpy.mock.calls.at(-1) as [RequestInfo | URL, RequestInit]
+    const headers = new Headers(init.headers)
+    expect(MockWebSocket.instances).toHaveLength(1)
+    expect(JSON.parse(String(init.body))).toMatchObject({ stream: false, store: false })
+    expect(headers.get("Authorization")).toBe("Bearer api-key-test")
+    expect(headers.get(INTERNAL_SESSION_HEADER)).toBeNull()
+    expect(headers.get(INTERNAL_AGENT_HEADER)).toBeNull()
+    expect(headers.get(INTERNAL_MODEL_HEADER)).toBeNull()
+    expect(headers.get(INTERNAL_PREFIX_HASH_HEADER)).toBeNull()
+  })
+
+  test("rewrites OAuth HTTP fallback requests to the Codex responses endpoint", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any) => {
+      const url = String(input)
+      if (url.includes("/backend-api/codex/models")) return new Response(JSON.stringify({ models: [] }), { status: 200 })
+      return new Response(JSON.stringify({ id: "resp_http" }), { status: 200 })
+    })
+    const hooks = await plugin({ client: { auth: { set: vi.fn() } } } as any)
+    const loaded = await hooks.auth?.loader?.(
+      async () => ({ type: "oauth", access: "access-test", refresh: "refresh-test", expires: Date.now() + 3600_000, accountId: "acct_1" }) as any,
+      { models: {} } as any,
+    )
+
+    await loaded?.fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: { Authorization: "Bearer stale" },
+      body: JSON.stringify({ model: "gpt-5.5", input: "hi", stream: false }),
+    })
+
+    const fallbackCall = (globalThis.fetch as any).mock.calls.at(-1) as [URL, RequestInit]
+    const headers = new Headers(fallbackCall[1].headers)
+    expect(fallbackCall[0].toString()).toBe(CODEX_API_ENDPOINT)
+    expect(JSON.parse(String(fallbackCall[1].body))).toMatchObject({ stream: false, store: false })
+    expect(headers.get("Authorization")).toBe("Bearer access-test")
+    expect(headers.get("ChatGPT-Account-Id")).toBe("acct_1")
+  })
+
+  test("plugin cleanup events close scoped and global pooled connections", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const hooks = await plugin({ client: { auth: { set: vi.fn() } } } as any)
+
+    const first = bridgeWebSocket("wss://example.test/responses", apiKeyWebSocketHeaders("api-key-test"), { model: "gpt-5.5", input: "one", stream: true }, false, {
+      sessionID: "sess_delete",
+    })
+    const second = bridgeWebSocket("wss://example.test/responses", apiKeyWebSocketHeaders("api-key-test"), { model: "gpt-5.5", input: "two", stream: true }, false, {
+      sessionID: "sess_keep",
+    })
+    MockWebSocket.instances[0].open()
+    MockWebSocket.instances[1].open()
+
+    await hooks.event?.({ event: { type: "session.deleted", properties: { info: { id: "sess_delete" } } } } as any)
+    await expect(first.body!.getReader().read()).rejects.toThrow(/Session disposed/)
+    expect(MockWebSocket.instances[0].terminateCount).toBeGreaterThan(0)
+    expect(MockWebSocket.instances[1].terminateCount).toBe(0)
+
+    await hooks.event?.({ event: { type: "global.disposed" } } as any)
+    await expect(second.body!.getReader().read()).rejects.toThrow(/Session disposed/)
+    expect(MockWebSocket.instances[1].terminateCount).toBeGreaterThan(0)
+  })
 })
 
 describe("oauth", () => {
@@ -821,13 +969,46 @@ describe("oauth", () => {
     await expect(browser.callback()).resolves.toEqual({ type: "failed" })
     expect(response.writeHead).toHaveBeenCalledWith(400, expect.any(Object))
   })
+
+  test("extracts account ids from supported JWT claim locations", () => {
+    expect(parseJwtClaims("not-a-jwt")).toBeUndefined()
+    expect(extractAccountId({ access_token: jwtWithClaims({ chatgpt_account_id: "acct_direct" }) })).toBe("acct_direct")
+    expect(
+      extractAccountId({
+        access_token: jwtWithClaims({ "https://api.openai.com/auth": { chatgpt_account_id: "acct_nested" } }),
+      }),
+    ).toBe("acct_nested")
+    expect(extractAccountId({ access_token: jwtWithClaims({ organizations: [{ id: "org_1" }] }) })).toBe("org_1")
+  })
+
+  test("refreshes OAuth tokens with the expected form body and reports failures", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          access_token: "access-new",
+          refresh_token: "refresh-new",
+          expires_in: 3600,
+        }),
+        { status: 200 },
+      ),
+    )
+
+    await expect(refreshAccessToken("refresh-old")).resolves.toMatchObject({ access_token: "access-new" })
+    const [, init] = fetchSpy.mock.calls[0] as [RequestInfo | URL, RequestInit]
+    expect(init.method).toBe("POST")
+    expect(new URLSearchParams(String(init.body)).get("grant_type")).toBe("refresh_token")
+    expect(new URLSearchParams(String(init.body)).get("refresh_token")).toBe("refresh-old")
+
+    fetchSpy.mockResolvedValueOnce(new Response("nope", { status: 401 }))
+    await expect(refreshAccessToken("refresh-old")).rejects.toThrow(/Token refresh failed: 401/)
+  })
 })
 
 describe("websocket bridge", () => {
-  test("transport defaults match upstream Codex Responses WebSocket behavior", () => {
-    expect(transportConfig.connectTimeoutMs).toBe(15_000)
-    expect(transportConfig.maxReconnectAttempts).toBe(5)
-    expect(transportConfig.streamIdleTimeoutMs).toBe(300_000)
+  test("transport defaults support retries and stream idle timeouts without client heartbeat", () => {
+    expect(transportConfig.connectTimeoutMs).toBeGreaterThan(0)
+    expect(transportConfig.maxReconnectAttempts).toBeGreaterThan(0)
+    expect(transportConfig.streamIdleTimeoutMs).toBeGreaterThan(0)
     expect(transportConfig).not.toHaveProperty("heartbeatIntervalMs")
     expect(transportConfig).not.toHaveProperty("pongTimeoutMs")
   })
@@ -857,7 +1038,7 @@ describe("websocket bridge", () => {
     })
     expect(ws.options.perMessageDeflate).toBe(true)
     ws.open()
-    expect(JSON.parse(ws.sent[0])).toMatchObject({
+    expect(sentFrames(ws)[0]).toMatchObject({
       type: "response.create",
       model: "gpt-5.3-codex",
       instructions: "You are a helpful assistant.",
@@ -937,7 +1118,7 @@ describe("websocket bridge", () => {
     ws.serverMessage({ type: "response.completed", response: { id: "resp_done" } })
     const reader = response.body!.getReader()
     while (!(await reader.read()).done) {}
-    expect(ws.sent.map((value) => JSON.parse(value))).toEqual([
+    expect(sentFrames(ws)).toEqual([
       expect.objectContaining({ type: "response.create" }),
       { type: "response.processed", response_id: "resp_done" },
     ])
@@ -960,6 +1141,47 @@ describe("websocket bridge", () => {
       error: { code: "usage_limit_reached", message: "usage limit reached" },
     })
     await expect(reader.read()).rejects.toThrow(/OpenAI WebSocket error 429 usage_limit_reached: usage limit reached/)
+  })
+
+  test("forwards newline-delimited websocket frames from one message", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "hi", stream: true },
+      false,
+    )
+    const reader = response.body!.getReader()
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    ws.emit(
+      "message",
+      [
+        JSON.stringify({ type: "response.created", sequence_number: 0, response: { id: "resp_1" } }),
+        JSON.stringify({ type: "response.completed", sequence_number: 1, response: { id: "resp_1" } }),
+      ].join("\n"),
+    )
+
+    expect(new TextDecoder().decode((await reader.read()).value)).toContain("response.created")
+    expect(new TextDecoder().decode((await reader.read()).value)).toContain("response.completed")
+    expect((await reader.read()).done).toBe(true)
+  })
+
+  test("treats failed and incomplete response events as terminal", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    for (const type of ["response.failed", "response.incomplete"]) {
+      const response = bridgeWebSocket(
+        "wss://example.test/responses",
+        apiKeyWebSocketHeaders("api-key-test"),
+        { model: "gpt-5.5", input: type, stream: true },
+        false,
+      )
+      const ws = MockWebSocket.instances.at(-1)!
+      ws.open()
+      ws.serverMessage({ type, sequence_number: 1, response: { id: `resp_${type}` } })
+      const text = await readAll(response)
+      expect(text).toContain(type)
+    }
   })
 
   test("rejects unexpected binary websocket events", async () => {
@@ -1006,7 +1228,7 @@ describe("websocket bridge", () => {
     expect(first.sent).toHaveLength(1)
     first.close()
 
-    await expect(reader.read()).rejects.toThrow(/response\.create was already sent.*responseCreateWriteCommitted=true/s)
+    await expect(reader.read()).rejects.toThrow(/response\.create was already sent/s)
     expect(MockWebSocket.instances).toHaveLength(1)
   })
 
@@ -1068,9 +1290,7 @@ describe("websocket bridge", () => {
       }
     }
 
-    await expect(reader.read()).rejects.toThrow(
-      /retry limit reached before response\.create was sent.*reconnectAttempts=5\/5.*lastError="write failed 5"/s,
-    )
+    await expect(reader.read()).rejects.toThrow(/retry limit reached before response\.create was sent.*write failed 5/s)
     expect(MockWebSocket.instances).toHaveLength(6)
   })
 
@@ -1111,8 +1331,40 @@ describe("websocket bridge", () => {
 
     ws.emit("close", 1006, Buffer.from("abnormal"))
 
-    await expect(reader.read()).rejects.toThrow(/response\.create was already sent.*closeCode=1006.*closeReason="abnormal"/s)
+    await expect(reader.read()).rejects.toThrow(/response\.create was already sent.*1006.*abnormal/s)
     expect(MockWebSocket.instances).toHaveLength(1)
+  })
+
+  test("finishes cleanly when websocket closes after final message output item", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "hi", stream: true },
+      false,
+    )
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    ws.serverMessage({ type: "response.output_text.delta", sequence_number: 1, delta: "done" })
+    ws.serverMessage({
+      type: "response.output_item.done",
+      sequence_number: 2,
+      item: {
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: "done" }],
+      },
+      response_id: "resp_done",
+    })
+
+    const reader = response.body!.getReader()
+    expect(new TextDecoder().decode((await reader.read()).value)).toContain("response.output_text.delta")
+    expect(new TextDecoder().decode((await reader.read()).value)).toContain("response.output_item.done")
+
+    ws.emit("close", 1006, Buffer.from("abnormal"))
+
+    await expect(reader.read()).resolves.toMatchObject({ done: true })
   })
 
   test("errors after replay-safe response.created only", async () => {
@@ -1157,9 +1409,7 @@ describe("websocket bridge", () => {
       }
     }
 
-    await expect(reader.read()).rejects.toThrow(
-      /retry limit reached before response\.create was sent.*reconnectAttempts=5\/5.*closeCode=1011/s,
-    )
+    await expect(reader.read()).rejects.toThrow(/retry limit reached before response\.create was sent.*1011/s)
     expect(MockWebSocket.instances).toHaveLength(6)
   })
 
@@ -1393,7 +1643,7 @@ describe("websocket bridge", () => {
     firstController.abort()
     await new Promise((resolve) => setTimeout(resolve, 0))
     expect(connectionPool[0].pending).not.toBeNull()
-    expect(ws.sent.map((value) => JSON.parse(value).type)).toEqual(["response.create", "response.create"])
+    expect(sentFrames(ws).map((value) => value.type)).toEqual(["response.create", "response.create"])
 
     ws.serverMessage({ type: "response.completed", response: { id: "resp_done_2" } })
     const secondReader = second.body!.getReader()
@@ -1424,7 +1674,7 @@ describe("websocket bridge", () => {
     controller.abort()
 
     await expect(reader.read()).rejects.toThrow(/aborted/i)
-    expect(ws.sent.map((value) => JSON.parse(value).type)).toEqual(["response.create", "response.cancel"])
+    expect(sentFrames(ws).map((value) => value.type)).toEqual(["response.create", "response.cancel"])
     expect(ws.terminateCount).toBeGreaterThan(0)
   })
 

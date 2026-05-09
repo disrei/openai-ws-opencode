@@ -28,6 +28,7 @@ export interface PendingRequest {
   sent: boolean
   writeCommitted: boolean
   framesReceived: boolean
+  finalMessageOutputReceived: boolean
   processedAckSent: boolean
   idleTimer: ReturnType<typeof setTimeout> | null
   metadata: PendingMetadata
@@ -314,6 +315,15 @@ function isTerminalEvent(eventType: string): boolean {
   return ["response.completed", "response.failed", "response.incomplete"].includes(eventType)
 }
 
+function isFinalMessageOutputItem(frame: Record<string, unknown>): boolean {
+  if (frame.type !== "response.output_item.done") return false
+  const item = frame.item
+  if (!item || typeof item !== "object" || Array.isArray(item)) return false
+  const value = item as Record<string, unknown>
+  if (value.type !== "message") return false
+  return value.status === undefined || value.status === "completed"
+}
+
 function schedulePendingIdleTimeout(conn: PooledConnection, reason: string) {
   const pending = conn.pending
   if (!pending || pending.done) return
@@ -402,6 +412,7 @@ function enqueueSSE(conn: PooledConnection, frame: Record<string, unknown>) {
   pending.framesReceived = true
   const eventType = typeof frame.type === "string" ? frame.type : "message"
   cacheResponseMetadata(pending, frame)
+  if (isFinalMessageOutputItem(frame)) pending.finalMessageOutputReceived = true
   const mappedError = wrappedWebSocketError(frame)
   if (mappedError) {
     fail(conn, mappedError, true)
@@ -427,6 +438,23 @@ function enqueueSSE(conn: PooledConnection, frame: Record<string, unknown>) {
     }
     terminalRelease(conn)
   }
+}
+
+function finishAfterFinalOutputSocketClose(conn: PooledConnection, pending: PendingRequest) {
+  finalizePending(pending)
+  pending.done = true
+  try {
+    pending.controller.close()
+  } catch {}
+  if (pending.metadata.responseId) {
+    conn.lastResponseID = pending.metadata.responseId
+    lastResponseIDByContext.set(conn.contextKey, pending.metadata.responseId)
+  }
+  conn.pending = null
+  conn.busy = false
+  conn.activeSessionID = undefined
+  conn.activeAgent = undefined
+  removeAndDrain(conn)
 }
 
 export function sendPending(conn: PooledConnection): boolean {
@@ -579,6 +607,10 @@ function handleSocketLoss(conn: PooledConnection) {
     finalizePending(pending)
     removeAndDrain(conn)
     closeSocket(conn, 1000, "socket lost")
+    return
+  }
+  if (pending.finalMessageOutputReceived) {
+    finishAfterFinalOutputSocketClose(conn, pending)
     return
   }
   if (pending.writeCommitted) {

@@ -414,6 +414,8 @@ async function runLiveTurn(
     "DEBUG",
     "--model",
     model,
+    "--variant",
+    "low",
     "--dangerously-skip-permissions",
     "--dir",
     projectDir,
@@ -450,6 +452,7 @@ async function runLiveTurn(
 
     const startStreamTimer = () => {
       llmStreamBoundarySeen = true
+      markStreaming()
       if (streamTimer || streamStarted) return
       streamTimer = setTimeout(() => {
         void finishReject(
@@ -851,7 +854,7 @@ async function main() {
 
     const abort = await runAbortTurn(
       "abort-after-stream",
-      "Begin a long answer by counting upward with one number per short sentence. Keep going until stopped.",
+      "Start your answer immediately with ABORT_STREAM_STARTED, then repeat ABORT_STREAM_STARTED one hundred times separated by spaces. Do not use tools.",
       projectDir,
       artifactsDir,
     )

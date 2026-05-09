@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url"
 import { describe, expect, test, afterEach, vi } from "vitest"
 import plugin from "../src/index.js"
 import { createBrowserAuthorization } from "../src/auth/oauth.js"
+import { transportConfig } from "../src/transport/config.js"
 import {
   CLIENT_ID,
   CODEX_ORIGINATOR,
@@ -283,6 +284,44 @@ describe("setup", () => {
     expect(twice).toBe(once)
   })
 
+  test("repairs stale plugin-generated model config while preserving custom models", () => {
+    const patched = patchConfigText(
+      JSON.stringify({
+        provider: {
+          "openai-ws": {
+            models: {
+              "gpt-5.5": {
+                name: "GPT 5.5 (WebSocket)",
+                limit: { context: 1050000, input: 922000, output: 128000 },
+                variants: { minimal: { reasoningEffort: "minimal" } },
+                "x-user-note": "keep",
+              },
+              "gpt-5.5-pro": {
+                name: "GPT 5.5 Pro (WebSocket)",
+                limit: { context: 1050000, output: 128000 },
+              },
+              "my-local-model": {
+                name: "My Local Model",
+                limit: { context: 42, output: 7 },
+              },
+            },
+          },
+        },
+      }),
+    )
+
+    const models = JSON.parse(patched).provider["openai-ws"].models
+    expect(models["gpt-5.5"].limit).toEqual({ context: 258400, output: 128000 })
+    expect(models["gpt-5.5"].variants).not.toHaveProperty("minimal")
+    expect(models["gpt-5.5"].variants).not.toHaveProperty("none")
+    expect(models["gpt-5.5"]["x-user-note"]).toBe("keep")
+    expect(models["gpt-5.5-pro"]).toBeUndefined()
+    expect(models["my-local-model"]).toEqual({
+      name: "My Local Model",
+      limit: { context: 42, output: 7 },
+    })
+  })
+
   test("does not duplicate existing versioned plugin specifiers", () => {
     const patched = patchConfigText(JSON.stringify({ plugin: ["openai-ws-opencode@0.1.0"] }))
     const parsed = JSON.parse(patched)
@@ -486,15 +525,15 @@ describe("models", () => {
   test("curated fallback models match official visible websocket models", () => {
     const resolved = resolveModels()
     expect(Object.keys(resolved).sort()).toEqual(["gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5"])
-    expect(resolved["gpt-5.5"].limit).toMatchObject({ context: 1050000, output: 128000 })
-    expect(resolved["gpt-5.4"].limit).toMatchObject({ context: 1050000, output: 128000 })
-    expect(resolved["gpt-5.4-mini"].limit).toMatchObject({ context: 400000, output: 128000 })
-    expect(resolved["gpt-5.3-codex"].limit).toMatchObject({ context: 400000, output: 128000 })
-    expect(resolved["gpt-5.2"].limit).toMatchObject({ context: 400000, output: 128000 })
-    expect(resolved["gpt-5.5"].variants).toHaveProperty("none")
-    expect(resolved["gpt-5.4"].variants).toHaveProperty("none")
-    expect(resolved["gpt-5.4-mini"].variants).toHaveProperty("none")
-    expect(resolved["gpt-5.2"].variants).toHaveProperty("none")
+    expect(resolved["gpt-5.5"].limit).toMatchObject({ context: 258400, output: 128000 })
+    expect(resolved["gpt-5.4"].limit).toMatchObject({ context: 258400, output: 128000 })
+    expect(resolved["gpt-5.4-mini"].limit).toMatchObject({ context: 258400, output: 128000 })
+    expect(resolved["gpt-5.3-codex"].limit).toMatchObject({ context: 258400, output: 128000 })
+    expect(resolved["gpt-5.2"].limit).toMatchObject({ context: 258400, output: 128000 })
+    expect(resolved["gpt-5.5"].variants).not.toHaveProperty("none")
+    expect(resolved["gpt-5.4"].variants).not.toHaveProperty("none")
+    expect(resolved["gpt-5.4-mini"].variants).not.toHaveProperty("none")
+    expect(resolved["gpt-5.2"].variants).not.toHaveProperty("none")
     expect(resolved["gpt-5.3-codex"].variants).not.toHaveProperty("none")
     expect(resolved["gpt-5.4-mini"].variants).toHaveProperty("xhigh")
     for (const model of Object.values(resolved)) expect(model.variants).not.toHaveProperty("minimal")
@@ -518,8 +557,10 @@ describe("models", () => {
       {
         slug: "gpt-5.4-codex",
         display_name: "GPT-5.4 Codex",
-        context_window: 123456,
+        context_window: 200000,
+        max_context_window: 222222,
         auto_compact_token_limit: 64000,
+        effective_context_window_percent: 80,
         prefer_websockets: true,
         supports_reasoning_summaries: true,
         supported_reasoning_levels: [{ effort: "low" }, { effort: "medium" }, { effort: "high" }],
@@ -535,7 +576,7 @@ describe("models", () => {
       providerID: "openai-ws",
       name: "GPT-5.4 Codex (WebSocket)",
       family: "gpt-codex",
-      limit: { context: 123456, output: 64000 },
+      limit: { context: 160000, output: 128000 },
     })
     expect(resolved["gpt-5.4-codex"].variants.medium).toMatchObject({ reasoningEffort: "medium", reasoningSummary: "auto" })
     expect(resolved["non-ws-model"]).toBeUndefined()
@@ -548,6 +589,7 @@ describe("models", () => {
           slug: "gpt-5.5",
           display_name: "GPT-5.5",
           context_window: 272000,
+          max_context_window: 272000,
           auto_compact_token_limit: null,
           prefer_websockets: true,
           supported_reasoning_levels: [{ effort: "low" }, { effort: "medium" }, { effort: "high" }, { effort: "xhigh" }],
@@ -562,7 +604,22 @@ describe("models", () => {
     )
 
     expect(resolved["gpt-5.5"].name).toBe("GPT-5.5 (WebSocket)")
-    expect(resolved["gpt-5.5"].limit).toEqual({ context: 272000, output: 128000 })
+    expect(resolved["gpt-5.5"].limit).toEqual({ context: 258400, output: 128000 })
+  })
+
+  test("uses max context when context window is absent in Codex catalog metadata", () => {
+    const resolved = resolveModelsForOAuth([
+      {
+        slug: "gpt-5.99",
+        display_name: "GPT-5.99",
+        max_context_window: 300000,
+        effective_context_window_percent: 90,
+        prefer_websockets: true,
+        supported_reasoning_levels: [{ effort: "high" }],
+      },
+    ])
+
+    expect(resolved["gpt-5.99"].limit).toEqual({ context: 270000, output: 128000 })
   })
 
   test("falls back to bundled models when the Codex catalog is unavailable or empty", () => {
@@ -573,8 +630,8 @@ describe("models", () => {
   test("filters API-key models to the OpenAI model id list and synthesizes candidate matches", () => {
     const resolved = resolveModelsForApiKey(new Set(["gpt-5.5", "gpt-5.99-mini", "unrelated-model"]))
     expect(Object.keys(resolved).sort()).toEqual(["gpt-5.5", "gpt-5.99-mini"])
-    expect(resolved["gpt-5.5"].limit).toMatchObject({ context: 1050000, output: 128000 })
-    expect(resolved["gpt-5.99-mini"].limit).toMatchObject({ context: 272000, output: 128000 })
+    expect(resolved["gpt-5.5"].limit).toMatchObject({ context: 258400, output: 128000 })
+    expect(resolved["gpt-5.99-mini"].limit).toMatchObject({ context: 258400, output: 128000 })
   })
 
   test("fetches the Codex catalog with OAuth headers", async () => {
@@ -716,6 +773,14 @@ describe("oauth", () => {
 })
 
 describe("websocket bridge", () => {
+  test("transport defaults match upstream Codex Responses WebSocket behavior", () => {
+    expect(transportConfig.connectTimeoutMs).toBe(15_000)
+    expect(transportConfig.maxReconnectAttempts).toBe(5)
+    expect(transportConfig.streamIdleTimeoutMs).toBe(300_000)
+    expect(transportConfig).not.toHaveProperty("heartbeatIntervalMs")
+    expect(transportConfig).not.toHaveProperty("pongTimeoutMs")
+  })
+
   test("sends response.create with ws headers", async () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const response = bridgeWebSocket(
@@ -952,6 +1017,7 @@ describe("websocket bridge", () => {
   })
 
   test("retries only before response.create has been sent", async () => {
+    vi.useFakeTimers()
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const response = bridgeWebSocket(
       "wss://example.test/responses",
@@ -961,17 +1027,20 @@ describe("websocket bridge", () => {
     )
     const reader = response.body!.getReader()
 
-    for (let attempt = 0; attempt < 4; attempt++) {
+    for (let attempt = 0; attempt < 6; attempt++) {
       const ws = MockWebSocket.instances[attempt]
       expect(ws).toBeDefined()
       ws.emit("close", 1011, Buffer.from("server_error"))
-      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 450))
+      if (attempt < 5) {
+        vi.advanceTimersByTime(2_000)
+        await Promise.resolve()
+      }
     }
 
     await expect(reader.read()).rejects.toThrow(
-      /retry limit reached before response\.create was sent.*reconnectAttempts=3\/3.*closeCode=1011/s,
+      /retry limit reached before response\.create was sent.*reconnectAttempts=5\/5.*closeCode=1011/s,
     )
-    expect(MockWebSocket.instances).toHaveLength(4)
+    expect(MockWebSocket.instances).toHaveLength(6)
   })
 
   test("evicts stale idle connections before reuse", async () => {

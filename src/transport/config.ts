@@ -1,6 +1,6 @@
 export const transportConfig = {
-  connectTimeoutMs: 10_000,
-  maxReconnectAttempts: 3,
+  connectTimeoutMs: 15_000,
+  maxReconnectAttempts: 5,
   reconnectBaseDelayMs: 100,
   reconnectMaxDelayMs: 2_000,
   idleEvictMs: 120_000,

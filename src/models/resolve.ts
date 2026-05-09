@@ -78,7 +78,7 @@ function variantsForModel(id: string, model: Pick<OpenAIWSModelDef, "reasoning" 
   if (!model.reasoning) return {}
   if (id.endsWith("-pro") || model.family === "gpt-pro") return makeVariants(["high"], false)
   if (id.includes("codex")) return makeVariants(["low", "medium", "high", "xhigh"], false)
-  return makeVariants(["none", "low", "medium", "high", "xhigh"], false)
+  return makeVariants(["low", "medium", "high", "xhigh"], false)
 }
 
 function isOpenAIWSCandidate(id: string): boolean {
@@ -90,7 +90,7 @@ function fallbackModelFor(id: string): OpenAIWSModelDef {
     name: `${id} (WebSocket)`,
     reasoning: true,
     temperature: false,
-    limit: { context: 272000, output: 128000 },
+    limit: { context: 258400, output: 128000 },
     variants: {},
     ...(id.includes("codex") ? { family: "gpt-codex" } : id.endsWith("-pro") ? { family: "gpt-pro" } : {}),
   }
@@ -98,11 +98,18 @@ function fallbackModelFor(id: string): OpenAIWSModelDef {
   return result
 }
 
+function resolvedCodexContextWindow(model: CodexModelInfo): number | undefined {
+  const context = model.context_window ?? model.max_context_window
+  if (!context) return undefined
+  const percent = model.effective_context_window_percent ?? 95
+  return Math.floor((context * percent) / 100)
+}
+
 function modelFromCodexCatalog(model: CodexModelInfo): [string, OpenAIWSModelDef] | undefined {
   const id = model.slug
   if (!id) return undefined
   if (model.prefer_websockets !== true && !isOpenAIWSCandidate(id)) return undefined
-  const context = model.context_window
+  const context = resolvedCodexContextWindow(model)
   if (!context) return undefined
   const efforts = (model.supported_reasoning_levels ?? [])
     .map((level) => level.effort)
@@ -114,7 +121,7 @@ function modelFromCodexCatalog(model: CodexModelInfo): [string, OpenAIWSModelDef
     temperature: false,
     limit: {
       context,
-      output: model.auto_compact_token_limit ?? Math.min(context, 128000),
+      output: 128000,
     },
     variants: reasoning ? makeVariants(efforts, Boolean(model.supports_reasoning_summaries)) : {},
     ...(id.includes("codex") ? { family: "gpt-codex" } : id.endsWith("-pro") ? { family: "gpt-pro" } : {}),
@@ -205,16 +212,45 @@ export function modelToOpenCodeConfig(model: OpenAIWSModelDef): OpenCodeConfigMo
   }
 }
 
+const GENERATED_CONFIG_MODEL_KEYS = new Set([
+  "name",
+  "family",
+  "release_date",
+  "attachment",
+  "reasoning",
+  "temperature",
+  "tool_call",
+  "limit",
+  "modalities",
+  "cost",
+  "provider",
+  "variants",
+])
+
+const LEGACY_PLUGIN_MODEL_IDS = new Set(["gpt-5.5-pro", "gpt-5.3-codex-spark", "gpt-5.2-codex", "gpt-5.1-codex"])
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function sanitizeBuiltInConfigOverride(override: unknown): Record<string, unknown> {
+  if (!isRecord(override)) return {}
+  const sanitized = { ...override }
+  for (const key of GENERATED_CONFIG_MODEL_KEYS) delete sanitized[key]
+  return sanitized
+}
+
 export function providerConfigModels(overrides: Record<string, unknown> = {}) {
   const models: Record<string, unknown> = {}
   for (const [id, model] of Object.entries(OPENAI_WS_MODELS)) {
     models[id] = {
       ...modelToOpenCodeConfig(model),
-      ...((overrides[id] as Record<string, unknown> | undefined) ?? {}),
+      ...sanitizeBuiltInConfigOverride(overrides[id]),
     }
   }
   for (const [id, override] of Object.entries(overrides)) {
     if (models[id]) continue
+    if (LEGACY_PLUGIN_MODEL_IDS.has(id)) continue
     models[id] = override
   }
   return models

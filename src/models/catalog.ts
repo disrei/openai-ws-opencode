@@ -22,6 +22,8 @@ export type CodexModelInfo = {
   display_name?: string
   description?: string
   context_window?: number
+  max_context_window?: number
+  effective_context_window_percent?: number
   supported_in_api?: boolean
   priority?: number
   supports_reasoning_summaries?: boolean

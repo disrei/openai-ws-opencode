@@ -21,36 +21,38 @@ export function makeVariants(efforts: string[], includeSummary = true): Record<s
   )
 }
 
+const CODEX_EFFECTIVE_CONTEXT_WINDOW = 258400
+
 export const OPENAI_WS_MODELS: Record<string, OpenAIWSModelDef> = {
   "gpt-5.5": {
     name: "GPT 5.5 (WebSocket)",
     reasoning: true,
     temperature: false,
-    limit: { context: 1050000, output: 128000 },
-    variants: makeVariants(["none", "low", "medium", "high", "xhigh"], false),
+    limit: { context: CODEX_EFFECTIVE_CONTEXT_WINDOW, output: 128000 },
+    variants: makeVariants(["low", "medium", "high", "xhigh"], false),
     release_date: "2026-04-23",
   },
   "gpt-5.4": {
     name: "GPT 5.4 (WebSocket)",
     reasoning: true,
     temperature: true,
-    limit: { context: 1050000, output: 128000 },
-    variants: makeVariants(["none", "low", "medium", "high", "xhigh"], false),
+    limit: { context: CODEX_EFFECTIVE_CONTEXT_WINDOW, output: 128000 },
+    variants: makeVariants(["low", "medium", "high", "xhigh"], false),
     release_date: "2026-03-05",
   },
   "gpt-5.4-mini": {
     name: "GPT 5.4 Mini (WebSocket)",
     reasoning: true,
     temperature: true,
-    limit: { context: 400000, output: 128000 },
-    variants: makeVariants(["none", "low", "medium", "high", "xhigh"], false),
+    limit: { context: CODEX_EFFECTIVE_CONTEXT_WINDOW, output: 128000 },
+    variants: makeVariants(["low", "medium", "high", "xhigh"], false),
     release_date: "2026-03-05",
   },
   "gpt-5.3-codex": {
     name: "GPT 5.3 Codex (WebSocket)",
     reasoning: true,
     temperature: false,
-    limit: { context: 400000, output: 128000 },
+    limit: { context: CODEX_EFFECTIVE_CONTEXT_WINDOW, output: 128000 },
     variants: makeVariants(["low", "medium", "high", "xhigh"], false),
     family: "gpt-codex",
     release_date: "2026-02-05",
@@ -59,8 +61,8 @@ export const OPENAI_WS_MODELS: Record<string, OpenAIWSModelDef> = {
     name: "GPT 5.2 (WebSocket)",
     reasoning: true,
     temperature: true,
-    limit: { context: 400000, output: 128000 },
-    variants: makeVariants(["none", "low", "medium", "high", "xhigh"]),
+    limit: { context: CODEX_EFFECTIVE_CONTEXT_WINDOW, output: 128000 },
+    variants: makeVariants(["low", "medium", "high", "xhigh"]),
     release_date: "2025-12-10",
   },
 }

@@ -52,7 +52,7 @@ If you do not want to use the setup command, add this shape to your OpenCode con
           "temperature": false,
           "attachment": true,
           "tool_call": true,
-          "limit": { "context": 400000, "input": 272000, "output": 128000 },
+          "limit": { "context": 258400, "output": 128000 },
           "modalities": { "input": ["text", "image"], "output": ["text"] },
           "options": {},
           "provider": { "npm": "@ai-sdk/openai", "api": "https://api.openai.com/v1" }

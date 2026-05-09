@@ -1,5 +1,5 @@
 import crypto from "node:crypto"
-import { CODEX_MODELS_ENDPOINT, CODEX_ORIGINATOR, OPENAI_MODELS_ENDPOINT, OPENAI_WS_BETA, USER_AGENT } from "../constants.js"
+import { CODEX_CLI_NPM_ENDPOINT, CODEX_MODELS_ENDPOINT, CODEX_ORIGINATOR, OPENAI_MODELS_ENDPOINT, OPENAI_WS_BETA, USER_AGENT } from "../constants.js"
 
 const DEFAULT_TIMEOUT_MS = 800
 const CATALOG_TTL_MS = 30 * 60 * 1000
@@ -29,7 +29,7 @@ export type CodexModelInfo = {
   default_verbosity?: string
   default_reasoning_level?: string
   supported_reasoning_levels?: CodexReasoningLevel[]
-  auto_compact_token_limit?: number
+  auto_compact_token_limit?: number | null
   prefer_websockets?: boolean
   input_modalities?: string[]
   available_in_plans?: string[]
@@ -74,6 +74,31 @@ function timeoutSignal(timeoutMs: number): AbortSignal | undefined {
   return typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(timeoutMs) : undefined
 }
 
+export function fallbackCodexClientVersion(userAgent = USER_AGENT): string {
+  return userAgent.includes("/") ? userAgent.split("/").at(-1) || userAgent : userAgent
+}
+
+export async function resolveCodexClientVersion(options: FetchOptions = {}): Promise<string> {
+  if (process.env[SKIP_CATALOG_ENV] === "1") return fallbackCodexClientVersion()
+  const key = "codex-cli-alpha-version"
+  const existing = cached<string>(key)
+  if (existing.hit && existing.value) return existing.value
+
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch
+  try {
+    const response = await fetchImpl(CODEX_CLI_NPM_ENDPOINT, {
+      signal: timeoutSignal(options.timeoutMs ?? DEFAULT_TIMEOUT_MS),
+      headers: { Accept: "application/json", "User-Agent": USER_AGENT },
+    })
+    if (!response.ok) return setCached(key, fallbackCodexClientVersion()) ?? fallbackCodexClientVersion()
+    const json = (await response.json()) as { "dist-tags"?: { alpha?: unknown }; version?: unknown }
+    const version = typeof json["dist-tags"]?.alpha === "string" ? json["dist-tags"].alpha : typeof json.version === "string" ? json.version : undefined
+    return setCached(key, version ?? fallbackCodexClientVersion()) ?? fallbackCodexClientVersion()
+  } catch {
+    return setCached(key, fallbackCodexClientVersion()) ?? fallbackCodexClientVersion()
+  }
+}
+
 export async function fetchCodexCatalog(options: CodexCatalogOptions): Promise<CodexModelInfo[] | undefined> {
   if (process.env[SKIP_CATALOG_ENV] === "1") return undefined
   const key = cacheKey("codex", options.accessToken, options.accountId)
@@ -82,7 +107,7 @@ export async function fetchCodexCatalog(options: CodexCatalogOptions): Promise<C
 
   const fetchImpl = options.fetchImpl ?? globalThis.fetch
   const url = new URL(CODEX_MODELS_ENDPOINT)
-  url.searchParams.set("client_version", USER_AGENT)
+  url.searchParams.set("client_version", await resolveCodexClientVersion({ fetchImpl, timeoutMs: options.timeoutMs }))
   try {
     const response = await fetchImpl(url, {
       signal: timeoutSignal(options.timeoutMs ?? DEFAULT_TIMEOUT_MS),

@@ -6,12 +6,13 @@ export const OPENAI_API_BASE = "https://api.openai.com/v1"
 export const CODEX_API_BASE = "https://chatgpt.com/backend-api/codex"
 export const CODEX_API_ENDPOINT = `${CODEX_API_BASE}/responses`
 export const CODEX_MODELS_ENDPOINT = `${CODEX_API_BASE}/models`
+export const CODEX_CLI_NPM_ENDPOINT = "https://registry.npmjs.org/@openai/codex"
 export const OPENAI_MODELS_ENDPOINT = `${OPENAI_API_BASE}/models`
 export const OPENAI_WS_URL = "wss://api.openai.com/v1/responses"
 export const CODEX_WS_URL = "wss://chatgpt.com/backend-api/codex/responses"
 export const OPENAI_WS_BETA = "responses_websockets=2026-02-06"
 export const CODEX_ORIGINATOR = "opencode"
-export const USER_AGENT = "openai-ws-opencode/0.1.8"
+export const USER_AGENT = "openai-ws-opencode/0.1.9"
 export const CODEX_OAUTH_SCOPE = "openid profile email offline_access"
 export const OAUTH_PORT = 1455
 

@@ -125,13 +125,12 @@ function modelFromCodexCatalog(model: CodexModelInfo): [string, OpenAIWSModelDef
 function toProviderModels(
   models: Record<string, OpenAIWSModelDef>,
   overrides: ProviderModelOverrides = {},
+  options: { authoritativeModels?: boolean } = {},
 ): Record<string, ProviderModelConfig> {
   const providerModels: Record<string, ProviderModelConfig> = {}
   for (const [id, model] of Object.entries(models)) {
-    providerModels[id] = {
-      ...modelToProviderConfig(id, model),
-      ...(overrides[id] ?? {}),
-    }
+    const resolved = modelToProviderConfig(id, model)
+    providerModels[id] = options.authoritativeModels ? { ...(overrides[id] ?? {}), ...resolved } : { ...resolved, ...(overrides[id] ?? {}) }
   }
   for (const [id, override] of Object.entries(overrides)) {
     if (providerModels[id]) continue
@@ -164,7 +163,7 @@ export function resolveModelsForOAuth(
     if (resolved) models[resolved[0]] = resolved[1]
   }
   if (Object.keys(models).length === 0) return resolveModels(overrides)
-  return toProviderModels(models, overrides)
+  return toProviderModels(models, overrides, { authoritativeModels: true })
 }
 
 export function resolveModelsForApiKey(

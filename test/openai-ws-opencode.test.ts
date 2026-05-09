@@ -24,8 +24,10 @@ import {
   resetPoolForTesting,
   resetCatalogCacheForTesting,
   resetWebSocketConstructorForTesting,
+  fallbackCodexClientVersion,
   fetchCodexCatalog,
   fetchOpenAIModelIds,
+  resolveCodexClientVersion,
   resolveModels,
   resolveModelsForApiKey,
   resolveModelsForOAuth,
@@ -539,6 +541,30 @@ describe("models", () => {
     expect(resolved["non-ws-model"]).toBeUndefined()
   })
 
+  test("uses Codex catalog limits instead of bundled setup limits for OAuth models", () => {
+    const resolved = resolveModelsForOAuth(
+      [
+        {
+          slug: "gpt-5.5",
+          display_name: "GPT-5.5",
+          context_window: 272000,
+          auto_compact_token_limit: null,
+          prefer_websockets: true,
+          supported_reasoning_levels: [{ effort: "low" }, { effort: "medium" }, { effort: "high" }, { effort: "xhigh" }],
+        },
+      ],
+      {
+        "gpt-5.5": {
+          limit: { context: 1050000, output: 128000 },
+          name: "Bundled setup GPT-5.5",
+        },
+      },
+    )
+
+    expect(resolved["gpt-5.5"].name).toBe("GPT-5.5 (WebSocket)")
+    expect(resolved["gpt-5.5"].limit).toEqual({ context: 272000, output: 128000 })
+  })
+
   test("falls back to bundled models when the Codex catalog is unavailable or empty", () => {
     expect(Object.keys(resolveModelsForOAuth(undefined)).sort()).toEqual(Object.keys(resolveModels()).sort())
     expect(Object.keys(resolveModelsForOAuth([])).sort()).toEqual(Object.keys(resolveModels()).sort())
@@ -552,12 +578,14 @@ describe("models", () => {
   })
 
   test("fetches the Codex catalog with OAuth headers", async () => {
-    const fetchImpl = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ models: [{ slug: "gpt-5.4-codex", context_window: 1 }] }), { status: 200 }),
-    )
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ "dist-tags": { alpha: "0.131.0-alpha.4" }, version: "0.130.0" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ models: [{ slug: "gpt-5.4-codex", context_window: 1 }] }), { status: 200 }))
     const catalog = await fetchCodexCatalog({ accessToken: "access-test", accountId: "acct_1", fetchImpl })
-    const [url, init] = fetchImpl.mock.calls[0] as [URL, RequestInit]
-    expect(url.toString()).toBe("https://chatgpt.com/backend-api/codex/models?client_version=openai-ws-opencode%2F0.1.8")
+    expect(fetchImpl.mock.calls[0][0]).toBe("https://registry.npmjs.org/@openai/codex")
+    const [url, init] = fetchImpl.mock.calls[1] as [URL, RequestInit]
+    expect(url.toString()).toBe("https://chatgpt.com/backend-api/codex/models?client_version=0.131.0-alpha.4")
     expect(init.headers).toMatchObject({
       Authorization: "Bearer access-test",
       "ChatGPT-Account-Id": "acct_1",
@@ -566,6 +594,21 @@ describe("models", () => {
       "User-Agent": USER_AGENT,
     })
     expect(catalog).toEqual([{ slug: "gpt-5.4-codex", context_window: 1 }])
+  })
+
+  test("resolves Codex client_version from the npm alpha dist-tag", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify({ "dist-tags": { alpha: "0.131.0-alpha.4" }, version: "0.130.0" }), { status: 200 }))
+    await expect(resolveCodexClientVersion({ fetchImpl })).resolves.toBe("0.131.0-alpha.4")
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "https://registry.npmjs.org/@openai/codex",
+      expect.objectContaining({ headers: expect.objectContaining({ Accept: "application/json", "User-Agent": USER_AGENT }) }),
+    )
+  })
+
+  test("falls back to package version when Codex client_version metadata is unavailable", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response("nope", { status: 500 }))
+    await expect(resolveCodexClientVersion({ fetchImpl })).resolves.toBe("0.1.9")
+    expect(fallbackCodexClientVersion("codex-rs/0.131.0-alpha.4")).toBe("0.131.0-alpha.4")
   })
 
   test("fetches OpenAI model ids and returns undefined on non-200 responses", async () => {

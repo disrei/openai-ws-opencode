@@ -219,6 +219,7 @@ function eventType(value: unknown): string {
 
 function isStreamingSignal(value: unknown, raw = ""): boolean {
   const type = eventType(value)
+  if (/step[_-]start/i.test(type)) return true
   if (/response\..*\.delta|message\.part|assistant|tool/i.test(type)) return true
   if (/response\.(output_text\.delta|output_item\.done|function_call)|message\.part|assistant/i.test(raw)) return true
   if (!value || typeof value !== "object") return false

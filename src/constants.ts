@@ -9,7 +9,9 @@ export const OPENAI_WS_URL = "wss://api.openai.com/v1/responses"
 export const CODEX_WS_URL = "wss://chatgpt.com/backend-api/codex/responses"
 export const OPENAI_WS_BETA = "responses_websockets=2026-02-06"
 export const CODEX_ORIGINATOR = "codex_cli_rs"
-export const OAUTH_PORT = 1456
+export const CODEX_OAUTH_SCOPE = "openid profile email offline_access api.connectors.read api.connectors.invoke"
+export const OAUTH_PORT = 1455
+export const OAUTH_FALLBACK_PORT = 1457
 export const DEFAULT_INSTRUCTIONS = "You are a helpful assistant."
 
 export const INTERNAL_SESSION_HEADER = "x-openai-ws-opencode-session-id"

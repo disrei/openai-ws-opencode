@@ -5,6 +5,8 @@ import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { describe, expect, test, afterEach, vi } from "vitest"
 import plugin from "../src/index.js"
+import { createBrowserAuthorization } from "../src/auth/oauth.js"
+import { CLIENT_ID, CODEX_OAUTH_SCOPE, CODEX_ORIGINATOR, OAUTH_FALLBACK_PORT, OAUTH_PORT } from "../src/constants.js"
 import {
   apiKeyWebSocketHeaders,
   bridgeWebSocket,
@@ -98,6 +100,29 @@ describe("setup", () => {
       expect(isDirectExecution(pathToFileURL(target).href, link)).toBe(true)
     } finally {
       rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("oauth authorize URL", () => {
+  test("matches Codex registered localhost ports and scopes", async () => {
+    const auth = await createBrowserAuthorization()
+    const callback = auth.callback()
+    try {
+      const url = new URL(auth.url)
+      const redirectUri = new URL(url.searchParams.get("redirect_uri") ?? "")
+      expect(url.origin).toBe("https://auth.openai.com")
+      expect(url.pathname).toBe("/oauth/authorize")
+      expect(url.searchParams.get("client_id")).toBe(CLIENT_ID)
+      expect(url.searchParams.get("originator")).toBe(CODEX_ORIGINATOR)
+      expect(url.searchParams.get("scope")).toBe(CODEX_OAUTH_SCOPE)
+      expect(url.searchParams.get("codex_cli_simplified_flow")).toBe("true")
+      expect(url.searchParams.get("id_token_add_organizations")).toBe("true")
+      expect([String(OAUTH_PORT), String(OAUTH_FALLBACK_PORT)]).toContain(redirectUri.port)
+      expect(redirectUri.pathname).toBe("/auth/callback")
+    } finally {
+      oauthTesting.reset()
+      await expect(callback).resolves.toEqual({ type: "failed" })
     }
   })
 })

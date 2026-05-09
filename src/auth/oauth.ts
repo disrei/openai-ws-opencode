@@ -1,6 +1,6 @@
 import http, { type IncomingMessage, type ServerResponse } from "node:http"
 import crypto from "node:crypto"
-import { CLIENT_ID, CODEX_ORIGINATOR, ISSUER, OAUTH_PORT } from "../constants.js"
+import { CLIENT_ID, CODEX_OAUTH_SCOPE, CODEX_ORIGINATOR, ISSUER, OAUTH_FALLBACK_PORT, OAUTH_PORT } from "../constants.js"
 import { exchangeCodeForTokens, extractAccountId, tokenExpiry, type TokenResponse } from "./tokens.js"
 
 type PendingOAuth = {
@@ -18,6 +18,7 @@ interface PkceCodes {
 }
 
 let oauthServer: http.Server | undefined
+let oauthRedirectUri: string | undefined
 let pendingOAuth: PendingOAuth | undefined
 
 const HTML_OK = "<!doctype html><html><body><h1>Authorization successful</h1><p>Return to OpenCode.</p></body></html>"
@@ -48,7 +49,7 @@ function buildAuthorizeUrl(redirectUri: string, pkce: PkceCodes, state: string):
     response_type: "code",
     client_id: CLIENT_ID,
     redirect_uri: redirectUri,
-    scope: "openid profile email offline_access",
+    scope: CODEX_OAUTH_SCOPE,
     code_challenge: pkce.challenge,
     code_challenge_method: "S256",
     id_token_add_organizations: "true",
@@ -107,21 +108,56 @@ async function handleCallback(req: IncomingMessage, res: ServerResponse) {
 }
 
 async function startOAuthServer(): Promise<string> {
-  if (!oauthServer) {
-    oauthServer = http.createServer((req, res) => {
-      void handleCallback(req, res)
-    })
-    await new Promise<void>((resolve, reject) => {
-      oauthServer?.once("error", reject)
-      oauthServer?.listen(OAUTH_PORT, "127.0.0.1", () => resolve())
-    })
+  if (oauthServer && oauthRedirectUri) return oauthRedirectUri
+  const server = http.createServer((req, res) => {
+    void handleCallback(req, res)
+  })
+  oauthServer = server
+
+  let port: number
+  try {
+    port = await listen(server, OAUTH_PORT)
+  } catch (error) {
+    if (!isAddressInUse(error)) {
+      oauthServer = undefined
+      throw error
+    }
+    try {
+      port = await listen(server, OAUTH_FALLBACK_PORT)
+    } catch (fallbackError) {
+      oauthServer = undefined
+      throw fallbackError
+    }
   }
-  return `http://localhost:${OAUTH_PORT}/auth/callback`
+
+  oauthRedirectUri = `http://localhost:${port}/auth/callback`
+  return oauthRedirectUri
+}
+
+function listen(server: http.Server, port: number): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const onError = (error: Error) => {
+      server.off("listening", onListening)
+      reject(error)
+    }
+    const onListening = () => {
+      server.off("error", onError)
+      resolve(port)
+    }
+    server.once("error", onError)
+    server.once("listening", onListening)
+    server.listen(port, "127.0.0.1")
+  })
+}
+
+function isAddressInUse(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EADDRINUSE"
 }
 
 export function stopOAuthServer() {
   oauthServer?.close()
   oauthServer = undefined
+  oauthRedirectUri = undefined
   if (pendingOAuth) {
     clearTimeout(pendingOAuth.timeout)
     pendingOAuth.reject(new Error("OAuth server stopped"))
@@ -169,7 +205,7 @@ export async function createBrowserAuthorization() {
 export async function createDeviceAuthorization() {
   const deviceResponse = await fetch(`${ISSUER}/api/accounts/deviceauth/usercode`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "User-Agent": "openai-ws-opencode/0.1.0" },
+    headers: { "Content-Type": "application/json", "User-Agent": "openai-ws-opencode/0.1.2" },
     body: JSON.stringify({ client_id: CLIENT_ID }),
   })
   if (!deviceResponse.ok) throw new Error("Failed to initiate device authorization")
@@ -188,7 +224,7 @@ export async function createDeviceAuthorization() {
       for (;;) {
         const response = await fetch(`${ISSUER}/api/accounts/deviceauth/token`, {
           method: "POST",
-          headers: { "Content-Type": "application/json", "User-Agent": "openai-ws-opencode/0.1.0" },
+          headers: { "Content-Type": "application/json", "User-Agent": "openai-ws-opencode/0.1.2" },
           body: JSON.stringify({
             device_auth_id: deviceData.device_auth_id,
             user_code: deviceData.user_code,

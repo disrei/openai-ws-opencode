@@ -1,0 +1,59 @@
+{
+  "name": "openai-ws-opencode",
+  "version": "0.1.0",
+  "description": "OpenCode plugin for OpenAI Responses WebSocket transport.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jaredboynton/openai-ws-opencode.git"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js"
+    }
+  },
+  "bin": {
+    "openai-ws-opencode": "./bin/setup.js"
+  },
+  "files": [
+    "dist/",
+    "bin/setup.js",
+    "README.md",
+    "SECURITY.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "scripts": {
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "build": "tsc -p tsconfig.build.json && bun build ./bin/setup.ts --target=node --format=esm --outfile=bin/setup.js --external=jsonc-parser",
+    "prepack": "bun run build",
+    "prepublishOnly": "bun run lint && bun run typecheck && bun test && bun run build"
+  },
+  "dependencies": {
+    "jsonc-parser": "^3.3.1",
+    "ws": "^8.18.3"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.0.0 <2"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.14.41",
+    "@types/node": "^22.15.0",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  },
+  "trustedDependencies": [
+    "esbuild"
+  ]
+}

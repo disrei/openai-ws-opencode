@@ -1,6 +1,6 @@
 {
   "name": "openai-ws-opencode",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "OpenCode plugin for OpenAI Responses WebSocket transport.",
   "type": "module",
   "license": "MIT",
@@ -35,6 +35,9 @@
     "lint": "tsc --noEmit -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
+    "live:test": "bun scripts/live-opencode.ts",
+    "hooks:install": "bun scripts/install-hooks.ts",
+    "prepare": "bun scripts/install-hooks.ts",
     "build": "tsc -p tsconfig.build.json && bun build ./bin/setup.ts --target=node --format=esm --outfile=bin/setup.js --external=jsonc-parser",
     "prepack": "bun run build",
     "prepublishOnly": "bun run lint && bun run typecheck && bun test && bun run build"

@@ -712,7 +712,7 @@ describe("models", () => {
 
   test("falls back to package version when Codex client_version metadata is unavailable", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(new Response("nope", { status: 500 }))
-    await expect(resolveCodexClientVersion({ fetchImpl })).resolves.toBe("0.1.10")
+    await expect(resolveCodexClientVersion({ fetchImpl })).resolves.toBe("0.1.13")
     expect(fallbackCodexClientVersion("codex-rs/0.131.0-alpha.4")).toBe("0.131.0-alpha.4")
   })
 

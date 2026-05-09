@@ -1,0 +1,32 @@
+#!/usr/bin/env sh
+set -eu
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$repo_root"
+
+if ! command -v bun >/dev/null 2>&1; then
+  echo "pre-push: bun is required. Install Bun, then retry." >&2
+  exit 1
+fi
+
+if ! command -v opencode >/dev/null 2>&1 && [ ! -x "$HOME/.opencode/bin/opencode" ]; then
+  echo "pre-push: opencode is required for live provider validation. Install/login to opencode, then retry." >&2
+  exit 1
+fi
+
+bun scripts/install-hooks.ts >/dev/null 2>&1 || true
+
+if [ ! -d node_modules ]; then
+  echo "pre-push: node_modules missing; running bun install --frozen-lockfile" >&2
+  bun install --frozen-lockfile
+fi
+
+bun run lint
+bun run typecheck
+bun run test
+
+if [ "${OPENAI_WS_PRE_PUSH_SKIP_LIVE:-}" = "1" ]; then
+  echo "pre-push: skipping live OpenCode harness because OPENAI_WS_PRE_PUSH_SKIP_LIVE=1" >&2
+else
+  bun run live:test
+fi

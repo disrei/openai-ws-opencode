@@ -63,8 +63,6 @@ export interface PooledConnection {
   idleTimer: ReturnType<typeof setTimeout> | null
   connectTimer: ReturnType<typeof setTimeout> | null
   retryTimer: ReturnType<typeof setTimeout> | null
-  heartbeatTimer: ReturnType<typeof setTimeout> | null
-  pongTimer: ReturnType<typeof setTimeout> | null
   detach: (() => void) | null
 }
 
@@ -166,13 +164,6 @@ function unrefTimer(timer: ReturnType<typeof setTimeout>): ReturnType<typeof set
   return timer
 }
 
-function clearHeartbeat(conn: PooledConnection) {
-  clearTimer(conn.heartbeatTimer)
-  clearTimer(conn.pongTimer)
-  conn.heartbeatTimer = null
-  conn.pongTimer = null
-}
-
 function clearPendingTimer(pending: PendingRequest | null | undefined) {
   if (!pending) return
   clearTimer(pending.idleTimer)
@@ -194,7 +185,6 @@ function detach(conn: PooledConnection) {
   clearTimer(conn.connectTimer)
   clearTimer(conn.idleTimer)
   clearTimer(conn.retryTimer)
-  clearHeartbeat(conn)
   conn.connectTimer = null
   conn.idleTimer = null
   conn.retryTimer = null
@@ -243,36 +233,6 @@ function removeAndDrain(conn: PooledConnection) {
   drainQueue(conn.scopeKey)
 }
 
-function scheduleHeartbeat(conn: PooledConnection) {
-  clearHeartbeat(conn)
-  const ws = conn.ws
-  if (!ws || ws.readyState !== readyState.OPEN) return
-  if (typeof ws.ping !== "function") return
-  const generation = conn.generation
-  conn.heartbeatTimer = unrefTimer(
-    setTimeout(() => {
-      conn.heartbeatTimer = null
-      if (generation !== conn.generation || !conn.ws) return
-      if (conn.ws.readyState !== readyState.OPEN) return
-      try {
-        conn.ws.ping?.()
-      } catch {
-        handleSocketLoss(conn)
-        return
-      }
-      conn.pongTimer = unrefTimer(
-        setTimeout(() => {
-          conn.pongTimer = null
-          if (generation !== conn.generation) return
-          conn.lastCloseCode = 1006
-          conn.lastCloseReason = "pong timeout"
-          handleSocketLoss(conn)
-        }, transportConfig.pongTimeoutMs),
-      )
-    }, transportConfig.heartbeatIntervalMs),
-  )
-}
-
 function release(conn: PooledConnection) {
   conn.lastSessionID = conn.activeSessionID
   conn.lastAgent = conn.activeAgent
@@ -297,7 +257,6 @@ function release(conn: PooledConnection) {
       }, transportConfig.idleEvictMs),
     )
   }
-  scheduleHeartbeat(conn)
 }
 
 function formatFailureMessage(conn: PooledConnection, reason: string): string {
@@ -357,9 +316,9 @@ function schedulePendingIdleTimeout(conn: PooledConnection, reason: string) {
       if (!current || current !== pending || current.done) return
       current.idleTimer = null
       conn.lastCloseCode = 1006
-      conn.lastCloseReason = "response idle timeout"
-      fail(conn, new Error(formatFailureMessage(conn, `response idle timeout after ${reason}`)), true)
-    }, transportConfig.responseIdleTimeoutMs),
+      conn.lastCloseReason = "idle timeout waiting for websocket"
+      fail(conn, new Error(formatFailureMessage(conn, `idle timeout waiting for websocket after ${reason}`)), true)
+    }, transportConfig.streamIdleTimeoutMs),
   )
 }
 
@@ -477,7 +436,6 @@ function normalizeCloseReason(reason: unknown): string | undefined {
 }
 
 function connect(conn: PooledConnection) {
-  clearHeartbeat(conn)
   const generation = ++conn.generation
   clearTimer(conn.retryTimer)
   conn.retryTimer = null
@@ -495,7 +453,6 @@ function connect(conn: PooledConnection) {
     clearTimer(conn.connectTimer)
     conn.connectTimer = null
     conn.lastActivityAt = Date.now()
-    scheduleHeartbeat(conn)
     sendPending(conn)
   }
 
@@ -519,14 +476,6 @@ function connect(conn: PooledConnection) {
       return
     }
     for (const frame of parseFrames(data)) enqueueSSE(conn, frame)
-  }
-
-  const handlePong = () => {
-    if (generation !== conn.generation) return
-    conn.lastActivityAt = Date.now()
-    clearTimer(conn.pongTimer)
-    conn.pongTimer = null
-    scheduleHeartbeat(conn)
   }
 
   const handleError = (error: unknown) => {
@@ -556,7 +505,6 @@ function connect(conn: PooledConnection) {
   on(ws, "open", handleOpen)
   on(ws, "upgrade", handleUpgrade)
   on(ws, "message", handleMessage)
-  on(ws, "pong", handlePong)
   on(ws, "error", handleError)
   on(ws, "close", handleClose)
 
@@ -564,7 +512,6 @@ function connect(conn: PooledConnection) {
     off(ws, "open", handleOpen)
     off(ws, "upgrade", handleUpgrade)
     off(ws, "message", handleMessage)
-    off(ws, "pong", handlePong)
     off(ws, "error", handleError)
     off(ws, "close", handleClose)
   }
@@ -574,7 +521,6 @@ function connect(conn: PooledConnection) {
 function handleSocketLoss(conn: PooledConnection) {
   clearTimer(conn.connectTimer)
   conn.connectTimer = null
-  clearHeartbeat(conn)
   const pending = conn.pending
   if (!pending || pending.done) {
     finalizePending(pending)
@@ -632,8 +578,6 @@ function create(wsUrl: string, headers: Record<string, string>, context: Transpo
     idleTimer: null,
     connectTimer: null,
     retryTimer: null,
-    heartbeatTimer: null,
-    pongTimer: null,
     detach: null,
   }
   connectionPool.push(conn)
@@ -680,7 +624,6 @@ function reserveConnection(wsUrl: string, headers: Record<string, string>, conte
   if (reusable) {
     clearTimer(reusable.idleTimer)
     reusable.idleTimer = null
-    clearHeartbeat(reusable)
     reusable.busy = true
     reusable.warm = false
     return reusable
@@ -766,7 +709,6 @@ export function ensureWarmConnection(wsUrl: string, headers: Record<string, stri
     existing.warm = true
     clearTimer(existing.idleTimer)
     existing.idleTimer = null
-    scheduleHeartbeat(existing)
     return existing
   }
   if (activeCount(key) >= transportConfig.maxConnectionsPerScope) return undefined

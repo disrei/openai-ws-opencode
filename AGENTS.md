@@ -75,7 +75,7 @@ Done means typechecking passes, tests pass, the build passes, setup remains idem
 - Put ChatGPT/Codex OAuth flow changes in `src/auth/oauth.ts` and token exchange/refresh parsing in `src/auth/tokens.ts`.
 - Put model table updates in `src/models/defaults.ts` and model resolution/catalog behavior in `src/models/resolve.ts`.
 - Put request body rewriting in `src/transport/body.ts` and auth/internal header behavior in `src/transport/headers.ts`.
-- Put WebSocket stream bridging in `src/transport/bridge.ts`; put connection reuse, queueing, retries, heartbeat, and turn-state behavior in `src/transport/pool.ts`.
+- Put WebSocket stream bridging in `src/transport/bridge.ts`; put connection reuse, queueing, retries, stream idle timeouts, and turn-state behavior in `src/transport/pool.ts`.
 - Add externally visible behavior coverage in `test/openai-ws-opencode.test.ts`.
 
 ## Safe-Change Rules

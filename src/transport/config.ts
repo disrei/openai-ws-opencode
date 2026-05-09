@@ -5,9 +5,7 @@ export const transportConfig = {
   reconnectMaxDelayMs: 2_000,
   idleEvictMs: 120_000,
   staleReuseMs: 60_000,
-  heartbeatIntervalMs: 30_000,
-  pongTimeoutMs: 10_000,
-  responseIdleTimeoutMs: 90_000,
+  streamIdleTimeoutMs: 300_000,
   maxConnectionsPerScope: 4,
   connectionMaxAgeMs: 55 * 60 * 1000,
 }

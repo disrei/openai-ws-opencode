@@ -607,7 +607,7 @@ describe("models", () => {
 
   test("falls back to package version when Codex client_version metadata is unavailable", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(new Response("nope", { status: 500 }))
-    await expect(resolveCodexClientVersion({ fetchImpl })).resolves.toBe("0.1.9")
+    await expect(resolveCodexClientVersion({ fetchImpl })).resolves.toBe("0.1.10")
     expect(fallbackCodexClientVersion("codex-rs/0.131.0-alpha.4")).toBe("0.131.0-alpha.4")
   })
 
@@ -1002,7 +1002,7 @@ describe("websocket bridge", () => {
     expect(firstWs.readyState).toBe(3)
   })
 
-  test("release schedules heartbeat when websocket supports ping", async () => {
+  test("release does not schedule a client heartbeat", async () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const response = bridgeWebSocket(
       "wss://example.test/responses",
@@ -1017,11 +1017,10 @@ describe("websocket bridge", () => {
     while (!(await reader.read()).done) {}
 
     expect(connectionPool).toHaveLength(1)
-    expect(connectionPool[0].heartbeatTimer).not.toBeNull()
-    expect(connectionPool[0].pongTimer).toBeNull()
+    expect(ws.pingCount).toBe(0)
   })
 
-  test("active pending heartbeat pings and pong timeout errors the stream", async () => {
+  test("active streams do not self-ping or fail at the old heartbeat window", async () => {
     vi.useFakeTimers()
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const response = bridgeWebSocket(
@@ -1038,12 +1037,20 @@ describe("websocket bridge", () => {
 
     vi.advanceTimersByTime(30_000)
     await Promise.resolve()
-    expect(ws.pingCount).toBeGreaterThan(0)
     vi.advanceTimersByTime(10_000)
     await Promise.resolve()
 
-    await expect(reader.read()).rejects.toThrow(/response\.create was already sent.*closeReason="pong timeout"/s)
-    expect(ws.terminateCount).toBeGreaterThan(0)
+    expect(ws.pingCount).toBe(0)
+    let pending = true
+    const pendingRead = reader.read().then((result) => {
+      pending = false
+      return result
+    })
+    await Promise.resolve()
+    expect(pending).toBe(true)
+
+    ws.serverMessage({ type: "response.completed", sequence_number: 2, response: { id: "resp_done" } })
+    expect(new TextDecoder().decode((await pendingRead).value)).toContain("response.completed")
   })
 
   test("replay-unsafe tool frame idle timeout errors the stream", async () => {
@@ -1067,10 +1074,10 @@ describe("websocket bridge", () => {
     const reader = response.body!.getReader()
     expect(new TextDecoder().decode((await reader.read()).value)).toContain("morph-mcp_edit_file")
 
-    vi.advanceTimersByTime(90_000)
+    vi.advanceTimersByTime(300_000)
     await Promise.resolve()
 
-    await expect(reader.read()).rejects.toThrow(/response idle timeout after response\.output_item\.done/)
+    await expect(reader.read()).rejects.toThrow(/idle timeout waiting for websocket after response\.output_item\.done/)
     expect(ws.terminateCount).toBeGreaterThan(0)
   })
 
@@ -1088,13 +1095,20 @@ describe("websocket bridge", () => {
     ws.open()
     const reader = response.body!.getReader()
 
-    for (let elapsed = 0; elapsed < 90_000; elapsed += 30_000) {
-      vi.advanceTimersByTime(30_000)
-      await Promise.resolve()
-      ws.pong()
-    }
+    vi.advanceTimersByTime(299_999)
+    await Promise.resolve()
+    let pending = true
+    const pendingRead = reader.read().then((result) => {
+      pending = false
+      return result
+    })
+    await Promise.resolve()
+    expect(pending).toBe(true)
+    expect(ws.pingCount).toBe(0)
+    vi.advanceTimersByTime(1)
+    await Promise.resolve()
 
-    await expect(reader.read()).rejects.toThrow(/response idle timeout after response\.create/)
+    await expect(pendingRead).rejects.toThrow(/idle timeout waiting for websocket after response\.create/)
     expect(ws.terminateCount).toBeGreaterThan(0)
   })
 
@@ -1114,23 +1128,11 @@ describe("websocket bridge", () => {
     const reader = response.body!.getReader()
     expect(new TextDecoder().decode((await reader.read()).value)).toContain("response.created")
 
-    vi.advanceTimersByTime(30_000)
-    await Promise.resolve()
-    ws.pong()
-    vi.advanceTimersByTime(30_000)
-    await Promise.resolve()
-    ws.pong()
-    vi.advanceTimersByTime(29_999)
+    vi.advanceTimersByTime(299_999)
     await Promise.resolve()
     ws.serverMessage({ type: "response.in_progress", sequence_number: 1, response: { id: "resp_safe" } })
     expect(new TextDecoder().decode((await reader.read()).value)).toContain("response.in_progress")
-    vi.advanceTimersByTime(30_000)
-    await Promise.resolve()
-    ws.pong()
-    vi.advanceTimersByTime(30_000)
-    await Promise.resolve()
-    ws.pong()
-    vi.advanceTimersByTime(29_999)
+    vi.advanceTimersByTime(299_999)
     await Promise.resolve()
     let pending = false
     const pendingRead = reader.read().then((result) => {
@@ -1144,7 +1146,7 @@ describe("websocket bridge", () => {
     vi.advanceTimersByTime(1)
     await Promise.resolve()
 
-    await expect(pendingRead).rejects.toThrow(/response idle timeout after response\.in_progress/)
+    await expect(pendingRead).rejects.toThrow(/idle timeout waiting for websocket after response\.in_progress/)
   })
 
   test("terminal event clears response idle timeout", async () => {

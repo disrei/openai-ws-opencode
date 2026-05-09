@@ -332,6 +332,7 @@ function assertRuntimeTurn(result: LiveRunResult, label: string) {
 }
 
 async function writeArtifacts(dir: string, name: string, result: Pick<CommandResult, "stdout" | "stderr">) {
+  await mkdir(dir, { recursive: true })
   await writeFile(path.join(dir, `${name}.stdout.log`), redact(result.stdout), "utf8")
   await writeFile(path.join(dir, `${name}.stderr.log`), redact(result.stderr), "utf8")
 }
@@ -452,7 +453,6 @@ async function runLiveTurn(
 
     const startStreamTimer = () => {
       llmStreamBoundarySeen = true
-      markStreaming()
       if (streamTimer || streamStarted) return
       streamTimer = setTimeout(() => {
         void finishReject(
@@ -543,6 +543,8 @@ async function runAbortTurn(name: string, prompt: string, projectDir: string, ar
     "DEBUG",
     "--model",
     model,
+    "--variant",
+    "low",
     "--dangerously-skip-permissions",
     "--dir",
     projectDir,
@@ -595,6 +597,7 @@ async function runAbortTurn(name: string, prompt: string, projectDir: string, ar
 
     const startStreamTimer = () => {
       llmStreamBoundarySeen = true
+      markStreaming()
       if (streamTimer || streamStarted) return
       streamTimer = setTimeout(() => {
         void fail(new Error(`${name} did not start streaming from ${model} within ${streamStartTimeoutMs}ms\n${redact(tail(stderr || stdout))}`))

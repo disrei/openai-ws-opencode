@@ -172,7 +172,7 @@ export async function resolveModelsBestEffort(
   try {
     const response = await fetchImpl("https://models.dev/api.json", {
       signal: AbortSignal.timeout(timeoutMs),
-      headers: { "User-Agent": "openai-ws-opencode/0.1.0" },
+      headers: { "User-Agent": "openai-ws-opencode/0.1.3" },
     })
     if (!response.ok) return resolveModels(overrides)
     return resolveModelsFromCatalog((await response.json()) as ModelsDevCatalog, overrides)

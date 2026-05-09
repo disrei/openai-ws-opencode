@@ -82,7 +82,7 @@ This path uses the Codex/ChatGPT backend and sends:
 
 - `Authorization: Bearer <access-token>`
 - `ChatGPT-Account-Id` when available
-- `originator: codex_cli_rs`
+- `originator: opencode`
 - `OpenAI-Beta: responses_websockets=2026-02-06`
 
 Important: the OAuth/Codex WebSocket path is unofficial, reuses Codex OAuth behavior, targets a private ChatGPT backend, can break without notice, and may carry account or terms-of-service risk. This project is not affiliated with OpenAI or OpenCode.
@@ -101,7 +101,7 @@ Then point OpenCode at the packed tarball through the plugin array:
 
 ```jsonc
 {
-  "plugin": ["openai-ws-opencode@file:/absolute/path/openai-ws-opencode-0.1.2.tgz"]
+  "plugin": ["openai-ws-opencode@file:/absolute/path/openai-ws-opencode-0.1.3.tgz"]
 }
 ```
 

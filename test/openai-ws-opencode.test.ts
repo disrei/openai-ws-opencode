@@ -105,7 +105,7 @@ describe("setup", () => {
 })
 
 describe("oauth authorize URL", () => {
-  test("matches Codex registered localhost ports and scopes", async () => {
+  test("uses a separate openai-ws flow with native OpenCode OAuth params", async () => {
     const auth = await createBrowserAuthorization()
     const callback = auth.callback()
     try {
@@ -148,7 +148,7 @@ describe("body and headers", () => {
     expect(oauthWebSocketHeaders("access-test", "acct_1")).toEqual({
       Authorization: "Bearer access-test",
       "ChatGPT-Account-Id": "acct_1",
-      originator: "codex_cli_rs",
+      originator: CODEX_ORIGINATOR,
       "OpenAI-Beta": "responses_websockets=2026-02-06",
     })
   })
@@ -299,7 +299,7 @@ describe("websocket bridge", () => {
     expect(ws.options.headers).toMatchObject({
       Authorization: "Bearer access-test",
       "ChatGPT-Account-Id": "acct_1",
-      originator: "codex_cli_rs",
+      originator: CODEX_ORIGINATOR,
       "OpenAI-Beta": "responses_websockets=2026-02-06",
     })
     ws.open()

@@ -205,7 +205,7 @@ export async function createBrowserAuthorization() {
 export async function createDeviceAuthorization() {
   const deviceResponse = await fetch(`${ISSUER}/api/accounts/deviceauth/usercode`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "User-Agent": "openai-ws-opencode/0.1.2" },
+    headers: { "Content-Type": "application/json", "User-Agent": "openai-ws-opencode/0.1.3" },
     body: JSON.stringify({ client_id: CLIENT_ID }),
   })
   if (!deviceResponse.ok) throw new Error("Failed to initiate device authorization")
@@ -224,7 +224,7 @@ export async function createDeviceAuthorization() {
       for (;;) {
         const response = await fetch(`${ISSUER}/api/accounts/deviceauth/token`, {
           method: "POST",
-          headers: { "Content-Type": "application/json", "User-Agent": "openai-ws-opencode/0.1.2" },
+          headers: { "Content-Type": "application/json", "User-Agent": "openai-ws-opencode/0.1.3" },
           body: JSON.stringify({
             device_auth_id: deviceData.device_auth_id,
             user_code: deviceData.user_code,

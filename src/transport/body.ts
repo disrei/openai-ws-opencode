@@ -1,4 +1,5 @@
 import {
+  BACKGROUND_ORCHESTRATION_ENV,
   OPENAI_WS_INSTALLATION_ID_ENV,
   X_CODEX_INSTALLATION_ID_HEADER,
   X_CODEX_WINDOW_ID_HEADER,
@@ -57,6 +58,10 @@ function normalizeInput(input: unknown): unknown {
   })
 }
 
+function shouldUseBackgroundResponses(): boolean {
+  return process.env[BACKGROUND_ORCHESTRATION_ENV] !== "0"
+}
+
 export function prepareBody(
   requestBody: Record<string, unknown>,
   isOAuth: boolean,
@@ -68,6 +73,7 @@ export function prepareBody(
   if (wsBody.input !== undefined) wsBody.input = normalizeInput(wsBody.input)
   if (wsBody.store === undefined) wsBody.store = false
   if (wsBody.stream === undefined) wsBody.stream = true
+  if (wsBody.background === undefined && shouldUseBackgroundResponses()) wsBody.background = true
   if (isOAuth) {
     delete wsBody.max_output_tokens
     delete wsBody.max_tokens

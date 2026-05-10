@@ -35,6 +35,7 @@
     "lint": "tsc --noEmit -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
+    "live:wire": "bun scripts/live-wire.ts",
     "live:test": "bun scripts/live-opencode.ts",
     "hooks:install": "bun scripts/install-hooks.ts",
     "prepare": "bun scripts/install-hooks.ts",

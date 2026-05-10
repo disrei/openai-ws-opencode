@@ -20,6 +20,7 @@ let WebSocketImpl: WebSocketConstructor = loadDefaultWebSocketConstructor()
 
 type PendingMetadata = {
   responseId?: string
+  activeResponseId?: string
 }
 
 export interface PendingRequest {
@@ -33,7 +34,6 @@ export interface PendingRequest {
   framesReceived: boolean
   finalMessageOutputReceived: boolean
   processedAckSent: boolean
-  explicitPreviousResponseID: boolean
   previousResponseNotFoundRetried: boolean
   idleTimer: ReturnType<typeof setTimeout> | null
   metadata: PendingMetadata
@@ -246,6 +246,17 @@ function removeAndDrain(conn: PooledConnection) {
   drainQueue(conn.scopeKey)
 }
 
+export function closeConnection(conn: PooledConnection, reason = "connection closed", graceful = false) {
+  removeAndDrain(conn)
+  if (graceful) {
+    try {
+      conn.ws?.close(1000, reason)
+    } catch {}
+    return
+  }
+  closeSocket(conn, 1000, reason)
+}
+
 function release(conn: PooledConnection) {
   conn.lastSessionID = conn.activeSessionID
   conn.lastAgent = conn.activeAgent
@@ -323,15 +334,6 @@ function fail(conn: PooledConnection, error: Error, shouldCloseSocket: boolean) 
   } else {
     drainQueue(conn.scopeKey)
   }
-}
-
-function cacheResponseMetadata(pending: PendingRequest, frame: Record<string, unknown>) {
-  const response = frame.response
-  if (response && typeof response === "object") {
-    const value = response as Record<string, unknown>
-    if (typeof value.id === "string") pending.metadata.responseId = value.id
-  }
-  if (typeof frame.response_id === "string") pending.metadata.responseId = frame.response_id
 }
 
 function isTerminalEvent(eventType: string): boolean {
@@ -464,13 +466,38 @@ function clearLastResponseID(conn: PooledConnection) {
   lastResponseIDByContext.delete(conn.contextKey)
 }
 
+function persistLastResponseID(conn: PooledConnection, responseID: string) {
+  conn.lastResponseID = responseID
+  lastResponseIDByContext.set(conn.contextKey, responseID)
+}
+
+function frameResponseID(frame: Record<string, unknown>): string | undefined {
+  let responseID: string | undefined
+  const response = frame.response
+  if (response && typeof response === "object") {
+    const value = response as Record<string, unknown>
+    if (typeof value.id === "string") responseID = value.id
+  }
+  if (typeof frame.response_id === "string") responseID = frame.response_id
+  return responseID
+}
+
+function cacheResponseMetadata(conn: PooledConnection, pending: PendingRequest, responseID: string | undefined) {
+  if (!responseID) return
+  pending.metadata.responseId = responseID
+  if (pending.metadata.activeResponseId === undefined || responseID !== pending.metadata.activeResponseId) {
+    pending.metadata.activeResponseId = responseID
+  }
+  persistLastResponseID(conn, responseID)
+}
+
+function isStaleResponseFrame(pending: PendingRequest, responseID: string | undefined): boolean {
+  return Boolean(responseID && pending.metadata.activeResponseId && responseID !== pending.metadata.activeResponseId)
+}
+
 function handlePreviousResponseNotFound(conn: PooledConnection, pending: PendingRequest): boolean {
   clearLastResponseID(conn)
   pending.metadata.responseId = undefined
-  if (!pending.explicitPreviousResponseID) {
-    fail(conn, new Error("OpenAI WebSocket previous_response_not_found for a request without explicit previous_response_id"), true)
-    return true
-  }
   if (pending.previousResponseNotFoundRetried) {
     fail(conn, new Error("OpenAI WebSocket previous_response_not_found after retrying without previous_response_id"), true)
     return true
@@ -502,10 +529,12 @@ function handlePreviousResponseNotFound(conn: PooledConnection, pending: Pending
 function enqueueSSE(conn: PooledConnection, frame: Record<string, unknown>) {
   const pending = conn.pending
   if (!pending || pending.done) return
+  const responseID = frameResponseID(frame)
+  const eventType = typeof frame.type === "string" ? frame.type : "message"
+  if (eventType !== "response.created" && isStaleResponseFrame(pending, responseID)) return
   pending.writeCommitted = true
   pending.framesReceived = true
-  const eventType = typeof frame.type === "string" ? frame.type : "message"
-  cacheResponseMetadata(pending, frame)
+  cacheResponseMetadata(conn, pending, responseID)
   if (isFinalMessageOutputItem(frame)) pending.finalMessageOutputReceived = true
   const mappedError = wrappedWebSocketError(frame)
   if (mappedError) {
@@ -528,12 +557,10 @@ function enqueueSSE(conn: PooledConnection, frame: Record<string, unknown>) {
     try {
       pending.controller.close()
     } catch {}
-    if (eventType === "response.completed" && pending.metadata.responseId) {
-      conn.lastResponseID = pending.metadata.responseId
-      lastResponseIDByContext.set(conn.contextKey, pending.metadata.responseId)
+    if (pending.metadata.responseId) {
+      persistLastResponseID(conn, pending.metadata.responseId)
     } else {
       clearLastResponseID(conn)
-      pending.metadata.responseId = undefined
     }
     terminalRelease(conn)
   }
@@ -545,7 +572,8 @@ function finishAfterFinalOutputSocketClose(conn: PooledConnection, pending: Pend
   try {
     pending.controller.close()
   } catch {}
-  clearLastResponseID(conn)
+  if (pending.metadata.responseId) persistLastResponseID(conn, pending.metadata.responseId)
+  else clearLastResponseID(conn)
   conn.pending = null
   conn.busy = false
   conn.activeSessionID = undefined
@@ -561,6 +589,7 @@ export function sendPending(conn: PooledConnection): boolean {
   const generation = conn.generation
   try {
     const body = { ...pending.body }
+    if (body.previous_response_id === undefined && conn.lastResponseID) body.previous_response_id = conn.lastResponseID
     const payload = JSON.stringify({ ...body, type: "response.create" })
     pending.sent = true
     ws.send(payload, (error?: Error) => {

@@ -1,6 +1,7 @@
 import { prepareBody } from "./body.js"
 import {
   acquireConnection,
+  closeConnection,
   closeConnections,
   isWebSocketPreStreamTransportError,
   sendPending,
@@ -13,10 +14,24 @@ type FallbackFetch = (signal: AbortSignal) => Promise<Response>
 
 function abortPending(conn: PooledConnection, error: Error) {
   const pending = conn.pending
+  let closeAfterCancel: (() => void) | undefined
   if (pending && !pending.done && conn.ws?.readyState === 1) {
+    const cancel = {
+      type: "response.cancel",
+      ...(pending.metadata.responseId ? { response_id: pending.metadata.responseId } : {}),
+    }
+    let closed = false
+    closeAfterCancel = () => {
+      if (closed) return
+      closed = true
+      closeConnection(conn, "Client aborted", Boolean(pending.metadata.responseId))
+    }
     try {
-      conn.ws.send(JSON.stringify({ type: "response.cancel" }))
-    } catch {}
+      conn.ws.send(JSON.stringify(cancel), closeAfterCancel)
+      setTimeout(closeAfterCancel, 250).unref?.()
+    } catch {
+      closeAfterCancel()
+    }
   }
   if (pending && !pending.done) {
     pending.done = true
@@ -26,7 +41,7 @@ function abortPending(conn: PooledConnection, error: Error) {
   }
   conn.pending = null
   conn.busy = false
-  closeConnections((candidate) => candidate === conn, "Client aborted")
+  if (!closeAfterCancel) closeConnections((candidate) => candidate === conn, "Client aborted")
 }
 
 function abortError(signal?: AbortSignal): Error {
@@ -43,7 +58,6 @@ export function bridgeWebSocket(
   fallbackFetch?: FallbackFetch,
 ): Response {
   const wsBody = prepareBody(requestBody, isOAuth, context)
-  const explicitPreviousResponseID = typeof wsBody.previous_response_id === "string" && wsBody.previous_response_id.length > 0
   const acquisitionController = new AbortController()
   const fallbackController = new AbortController()
   let conn: PooledConnection | undefined
@@ -151,7 +165,6 @@ export function bridgeWebSocket(
       framesReceived: false,
       finalMessageOutputReceived: false,
       processedAckSent: false,
-      explicitPreviousResponseID,
       previousResponseNotFoundRetried: false,
       idleTimer: null,
       metadata: {},

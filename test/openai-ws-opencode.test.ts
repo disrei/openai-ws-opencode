@@ -461,8 +461,8 @@ describe("setup", () => {
         provider: {
           "openai-ws": {
             models: {
-              "gpt-5.5": {
-                name: "GPT 5.5 (WebSocket)",
+              "gpt-5.4-mini": {
+                name: "GPT 5.4 Mini (WebSocket)",
                 limit: { context: 1050000, input: 922000, output: 128000 },
                 variants: { minimal: { reasoningEffort: "minimal" } },
                 "x-user-note": "keep",
@@ -482,11 +482,11 @@ describe("setup", () => {
     )
 
     const models = JSON.parse(patched).provider["openai-ws"].models
-    expect(models["gpt-5.5"].limit.context).toBeLessThan(1050000)
-    expect(models["gpt-5.5"].limit.output).toBe(128000)
-    expect(models["gpt-5.5"].variants).not.toHaveProperty("minimal")
-    expect(models["gpt-5.5"].variants).not.toHaveProperty("none")
-    expect(models["gpt-5.5"]["x-user-note"]).toBe("keep")
+    expect(models["gpt-5.4-mini"].limit.context).toBeLessThan(1050000)
+    expect(models["gpt-5.4-mini"].limit.output).toBe(128000)
+    expect(models["gpt-5.4-mini"].variants).not.toHaveProperty("minimal")
+    expect(models["gpt-5.4-mini"].variants).not.toHaveProperty("none")
+    expect(models["gpt-5.4-mini"]["x-user-note"]).toBe("keep")
     expect(models["gpt-5.5-pro"]).toBeUndefined()
     expect(models["my-local-model"]).toEqual({
       name: "My Local Model",

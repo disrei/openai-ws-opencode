@@ -133,6 +133,7 @@ type WireTurn = {
 
 type WireWebSocketOptions = {
   autoComplete?: boolean | ((body: Record<string, unknown>, turn: WireTurn) => boolean)
+  responseCreatedID?: string | ((body: Record<string, unknown>, turn: WireTurn) => string | undefined)
 }
 
 type WireWebSocketServer = { port: number; stop(force?: boolean): void }
@@ -205,6 +206,8 @@ function listenNodeWireWebSocket(received: WireTurn[], options: WireWebSocketOpt
         turn.messages.push(body)
         if (body.type !== "response.create") return
         turn.bodies.push(body)
+        const createdID = wireResponseCreatedID(options, body, turn)
+        if (createdID) socket.send(JSON.stringify({ type: "response.created", response: { id: createdID } }))
         if (shouldAutoCompleteWireFrame(options, body, turn)) {
           socket.send(JSON.stringify({ type: "response.completed", response: { id: `resp_live_${wireInputText(body)}` } }))
         }
@@ -234,6 +237,11 @@ function listenNodeWireWebSocket(received: WireTurn[], options: WireWebSocketOpt
 function shouldAutoCompleteWireFrame(options: WireWebSocketOptions, body: Record<string, unknown>, turn: WireTurn): boolean {
   if (typeof options.autoComplete === "function") return options.autoComplete(body, turn)
   return options.autoComplete ?? true
+}
+
+function wireResponseCreatedID(options: WireWebSocketOptions, body: Record<string, unknown>, turn: WireTurn): string | undefined {
+  if (typeof options.responseCreatedID === "function") return options.responseCreatedID(body, turn)
+  return options.responseCreatedID
 }
 
 function parseWireHeaders(text: string): Record<string, string> {
@@ -301,6 +309,8 @@ function receiveWireFrames(
     state.turn.messages.push(body)
     if (body.type !== "response.create") continue
     state.turn.bodies.push(body)
+    const createdID = wireResponseCreatedID(options, body, state.turn)
+    if (createdID) socket.write(encodeWireTextFrame(JSON.stringify({ type: "response.created", response: { id: createdID } })))
     if (shouldAutoCompleteWireFrame(options, body, state.turn)) {
       socket.write(encodeWireTextFrame(JSON.stringify({ type: "response.completed", response: { id: `resp_live_${wireInputText(body)}` } })))
     }
@@ -410,6 +420,12 @@ async function waitForWire(condition: () => boolean, label: string, timeoutMs = 
     await new Promise((resolve) => setTimeout(resolve, 10))
   }
   throw new Error(`Timed out waiting for ${label}`)
+}
+
+function parseSSEData(text: string): Record<string, unknown> {
+  const data = text.match(/^data: (.*)$/m)?.[1]
+  if (!data) throw new Error(`SSE frame did not include data: ${text}`)
+  return JSON.parse(data) as Record<string, unknown>
 }
 
 function jwtWithClaims(claims: Record<string, unknown>): string {
@@ -901,7 +917,7 @@ describe("plugin auth loader", () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(
         JSON.stringify({
-          data: [{ id: "gpt-5.5" }, { id: "gpt-5.88" }],
+          data: [{ id: "gpt-5.4-mini" }, { id: "gpt-5.88" }],
         }),
         { status: 200 },
       ),
@@ -962,7 +978,7 @@ describe("plugin auth loader", () => {
 
     await loaded?.fetch("https://api.openai.com/v1/responses", {
       method: "POST",
-      body: JSON.stringify({ model: "gpt-5.5", input: "hi", stream: true }),
+      body: JSON.stringify({ model: "gpt-5.4-mini", input: "hi", stream: true }),
     })
 
     expect(setAuth).toHaveBeenCalled()
@@ -981,10 +997,10 @@ describe("plugin auth loader", () => {
         Authorization: "Bearer stale",
         [INTERNAL_SESSION_HEADER]: "sess_1",
         [INTERNAL_AGENT_HEADER]: "review",
-        [INTERNAL_MODEL_HEADER]: "gpt-5.5",
+        [INTERNAL_MODEL_HEADER]: "gpt-5.4-mini",
         [INTERNAL_PREFIX_HASH_HEADER]: "prefix_1",
       },
-      body: JSON.stringify({ model: "gpt-5.5", input: "hi", stream: false }),
+      body: JSON.stringify({ model: "gpt-5.4-mini", input: "hi", stream: false }),
     })
 
     const [, init] = fetchSpy.mock.calls.at(-1) as [RequestInfo | URL, RequestInit]
@@ -1003,7 +1019,7 @@ describe("plugin auth loader", () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any) => {
       const url = String(input)
-      if (url.includes("/v1/models")) return new Response(JSON.stringify({ data: [{ id: "gpt-5.5" }] }), { status: 200 })
+      if (url.includes("/v1/models")) return new Response(JSON.stringify({ data: [{ id: "gpt-5.4-mini" }] }), { status: 200 })
       return new Response('event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_http"}}\n\n', {
         status: 200,
         headers: { "content-type": "text/event-stream" },
@@ -1014,7 +1030,7 @@ describe("plugin auth loader", () => {
 
     const response = await loaded?.fetch("https://api.openai.com/v1/responses", {
       method: "POST",
-      body: JSON.stringify({ model: "gpt-5.5", input: "hi", stream: true }),
+      body: JSON.stringify({ model: "gpt-5.4-mini", input: "hi", stream: true }),
     })
 
     for (let attempt = 0; attempt < 6; attempt++) {
@@ -1050,7 +1066,7 @@ describe("plugin auth loader", () => {
     await loaded?.fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: { Authorization: "Bearer stale" },
-      body: JSON.stringify({ model: "gpt-5.5", input: "hi", stream: false }),
+      body: JSON.stringify({ model: "gpt-5.4-mini", input: "hi", stream: false }),
     })
 
     const fallbackCall = (globalThis.fetch as any).mock.calls.at(-1) as [URL, RequestInit]
@@ -1065,10 +1081,10 @@ describe("plugin auth loader", () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const hooks = await plugin({ client: { auth: { set: vi.fn() } } } as any)
 
-    const first = bridgeWebSocket("wss://example.test/responses", apiKeyWebSocketHeaders("api-key-test"), { model: "gpt-5.5", input: "one", stream: true }, false, {
+    const first = bridgeWebSocket("wss://example.test/responses", apiKeyWebSocketHeaders("api-key-test"), { model: "gpt-5.4-mini", input: "one", stream: true }, false, {
       sessionID: "sess_delete",
     })
-    const second = bridgeWebSocket("wss://example.test/responses", apiKeyWebSocketHeaders("api-key-test"), { model: "gpt-5.5", input: "two", stream: true }, false, {
+    const second = bridgeWebSocket("wss://example.test/responses", apiKeyWebSocketHeaders("api-key-test"), { model: "gpt-5.4-mini", input: "two", stream: true }, false, {
       sessionID: "sess_keep",
     })
     MockWebSocket.instances[0].open()
@@ -1145,7 +1161,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       oauthWebSocketHeaders("access-test", "acct_1"),
-      { model: "gpt-5.3-codex", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       true,
       { sessionID: "sess_1", agent: "primary" },
     )
@@ -1167,7 +1183,8 @@ describe("websocket bridge", () => {
     ws.open()
     expect(sentFrames(ws)[0]).toMatchObject({
       type: "response.create",
-      model: "gpt-5.3-codex",
+      model: "gpt-5.4-mini",
+      background: true,
       instructions: "You are a helpful assistant.",
       input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
       store: false,
@@ -1175,12 +1192,29 @@ describe("websocket bridge", () => {
     })
   })
 
-  test("keeps turn-state sockets reusable without implicit continuation on the next turn", async () => {
+  test("can opt out of default background websocket responses for foreground compatibility", async () => {
+    process.env.OPENAI_WS_OPENCODE_BACKGROUND_ORCHESTRATION = "0"
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
+      false,
+    )
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    expect(sentFrames(ws)[0]).toMatchObject({ type: "response.create", model: "gpt-5.4-mini" })
+    expect(sentFrames(ws)[0]).not.toHaveProperty("background")
+    ws.serverMessage({ type: "response.completed", response: { id: "resp_foreground" } })
+    await readAll(response)
+  })
+
+  test("keeps turn-state sockets reusable and sends continuation on the next turn", async () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const first = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
       { sessionID: "sess_1", agent: "review", stablePrefixHash: "prefix_1" },
     )
@@ -1189,7 +1223,7 @@ describe("websocket bridge", () => {
       "x-codex-turn-state": "turn_1",
       "x-models-etag": "etag_1",
       "x-reasoning-included": "true",
-      "openai-model": "gpt-5.5",
+      "openai-model": "gpt-5.4-mini",
     })
     firstWs.open()
     expect(firstWs.options.headers).toMatchObject({
@@ -1206,7 +1240,7 @@ describe("websocket bridge", () => {
     const second = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "again", stream: true },
+      { model: "gpt-5.4-mini", input: "again", stream: true },
       false,
       { sessionID: "sess_1", agent: "review", stablePrefixHash: "prefix_1" },
     )
@@ -1214,13 +1248,13 @@ describe("websocket bridge", () => {
     const secondFrame = JSON.parse(firstWs.sent[1])
     expect(secondFrame).toMatchObject({
       type: "response.create",
+      previous_response_id: "resp_1",
       prompt_cache_key: "prefix_1",
       client_metadata: {
         "x-codex-window-id": "sess_1",
         "x-openai-subagent": "review",
       },
     })
-    expect(secondFrame).not.toHaveProperty("previous_response_id")
     firstWs.serverMessage({ type: "response.completed", response: { id: "resp_2" } })
     const secondReader = second.body!.getReader()
     while (!(await secondReader.read()).done) {}
@@ -1231,7 +1265,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "again", stream: true, previous_response_id: "resp_explicit" },
+      { model: "gpt-5.4-mini", input: "again", stream: true, previous_response_id: "resp_explicit" },
       false,
       { sessionID: "sess_1" },
     )
@@ -1245,12 +1279,12 @@ describe("websocket bridge", () => {
     await readAll(response)
   })
 
-  test("sends hook-mutated full context without hidden continuation state", async () => {
+  test("sends hook-mutated full context with persisted continuation state", async () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const first = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "first", stream: true },
+      { model: "gpt-5.4-mini", input: "first", stream: true },
       false,
       { sessionID: "sess_hooks" },
     )
@@ -1267,7 +1301,7 @@ describe("websocket bridge", () => {
     const second = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: fullContextInput, stream: true },
+      { model: "gpt-5.4-mini", input: fullContextInput, stream: true },
       false,
       { sessionID: "sess_hooks" },
     )
@@ -1275,15 +1309,94 @@ describe("websocket bridge", () => {
     expect(frame).toMatchObject({
       type: "response.create",
       input: fullContextInput,
+      previous_response_id: "resp_first",
     })
-    expect(frame).not.toHaveProperty("previous_response_id")
     ws.serverMessage({ type: "response.completed", response: { id: "resp_second" } })
     await readAll(second)
   })
 
+  test("persists response.created ids immediately through abort for automatic continuation", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const controller = new AbortController()
+    const first = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.4-mini", input: "before cancel", stream: true },
+      false,
+      { sessionID: "sess_created_abort" },
+      controller.signal,
+    )
+    const reader = first.body!.getReader()
+    const firstWs = MockWebSocket.instances[0]
+    firstWs.open()
+    firstWs.serverMessage({ type: "response.created", response: { id: "resp_created_before_cancel" } })
+    expect(parseSSEData(new TextDecoder().decode((await reader.read()).value))).toMatchObject({
+      type: "response.created",
+      response: { id: "resp_created_before_cancel" },
+    })
+
+    controller.abort(new DOMException("restart", "AbortError"))
+
+    await expect(reader.read()).rejects.toThrow(/restart|aborted/i)
+    expect(sentFrames(firstWs).map((value) => value.type)).toEqual(["response.create", "response.cancel"])
+    expect(sentFrames(firstWs)[1]).toMatchObject({ response_id: "resp_created_before_cancel" })
+
+    const second = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.4-mini", input: "after cancel", stream: true },
+      false,
+      { sessionID: "sess_created_abort" },
+    )
+    const secondWs = MockWebSocket.instances.at(-1)!
+    secondWs.open()
+    expect(sentFrames(secondWs)[0]).toMatchObject({
+      type: "response.create",
+      previous_response_id: "resp_created_before_cancel",
+    })
+    secondWs.serverMessage({ type: "response.completed", response: { id: "resp_after_cancel" } })
+    await readAll(second)
+  })
+
+  test("ignores stale events from superseded response ids without closing the active stream", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
+      false,
+    )
+    const reader = response.body!.getReader()
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    ws.serverMessage({ type: "response.created", response: { id: "resp_A" } })
+    expect(parseSSEData(new TextDecoder().decode((await reader.read()).value))).toMatchObject({
+      type: "response.created",
+      response: { id: "resp_A" },
+    })
+
+    ws.serverMessage({ type: "response.created", response: { id: "resp_B" } })
+    expect(parseSSEData(new TextDecoder().decode((await reader.read()).value))).toMatchObject({
+      type: "response.created",
+      response: { id: "resp_B" },
+    })
+
+    ws.serverMessage({ type: "response.output_text.delta", response_id: "resp_A", delta: "stale" })
+    ws.serverMessage({ type: "response.completed", response: { id: "resp_A" } })
+    ws.serverMessage({ type: "response.output_text.delta", response_id: "resp_B", delta: "fresh" })
+    ws.serverMessage({ type: "response.completed", response: { id: "resp_B" } })
+
+    const fresh = new TextDecoder().decode((await reader.read()).value)
+    expect(fresh).toContain("fresh")
+    expect(fresh).not.toContain("stale")
+    const terminal = parseSSEData(new TextDecoder().decode((await reader.read()).value))
+    expect(terminal).toMatchObject({ type: "response.completed", response: { id: "resp_B" } })
+    expect(await reader.read()).toMatchObject({ done: true })
+  })
+
   test("snapshots response body at bridge entry", async () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
-    const body: Record<string, unknown> = { model: "gpt-5.5", input: "before", stream: true }
+    const body: Record<string, unknown> = { model: "gpt-5.4-mini", input: "before", stream: true }
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
@@ -1301,7 +1414,7 @@ describe("websocket bridge", () => {
     const frame = sentFrames(ws)[0]
     expect(frame).toMatchObject({
       type: "response.create",
-      model: "gpt-5.5",
+      model: "gpt-5.4-mini",
       input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "before" }] }],
       prompt_cache_key: "prefix_before",
     })
@@ -1316,13 +1429,13 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
     )
+    const reader = response.body!.getReader()
     const ws = MockWebSocket.instances[0]
     ws.open()
     ws.serverMessage({ type: "response.completed", response: { id: "resp_done" } })
-    const reader = response.body!.getReader()
     while (!(await reader.read()).done) {}
     expect(sentFrames(ws)).toEqual([
       expect.objectContaining({ type: "response.create" }),
@@ -1335,7 +1448,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       CODEX_WS_URL,
       oauthWebSocketHeaders("access-test", "acct_1"),
-      { model: "gpt-5.3-codex", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       true,
     )
     const ws = MockWebSocket.instances[0]
@@ -1355,7 +1468,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       CODEX_WS_URL,
       oauthWebSocketHeaders("access-test", "acct_1"),
-      { model: "gpt-5.3-codex", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       true,
     )
     const ws = MockWebSocket.instances[0]
@@ -1371,7 +1484,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
     )
     const reader = response.body!.getReader()
@@ -1390,7 +1503,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
     )
     const reader = response.body!.getReader()
@@ -1414,7 +1527,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
       {},
       undefined,
@@ -1442,7 +1555,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
       {},
       undefined,
@@ -1467,7 +1580,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
       {},
       controller.signal,
@@ -1485,7 +1598,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
     )
     const reader = response.body!.getReader()
@@ -1510,7 +1623,7 @@ describe("websocket bridge", () => {
       const response = bridgeWebSocket(
         "wss://example.test/responses",
         apiKeyWebSocketHeaders("api-key-test"),
-        { model: "gpt-5.5", input: type, stream: true },
+        { model: "gpt-5.4-mini", input: type, stream: true },
         false,
       )
       const ws = MockWebSocket.instances.at(-1)!
@@ -1521,12 +1634,12 @@ describe("websocket bridge", () => {
     }
   })
 
-  test("does not add implicit continuation after failed response events", async () => {
+  test("persists continuation after failed response events when a response id is emitted", async () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const first = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "first", stream: true },
+      { model: "gpt-5.4-mini", input: "first", stream: true },
       false,
       { sessionID: "sess_1" },
     )
@@ -1538,7 +1651,7 @@ describe("websocket bridge", () => {
     const failed = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "failed", stream: true },
+      { model: "gpt-5.4-mini", input: "failed", stream: true },
       false,
       { sessionID: "sess_1" },
     )
@@ -1548,12 +1661,12 @@ describe("websocket bridge", () => {
     const next = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "next", stream: true },
+      { model: "gpt-5.4-mini", input: "next", stream: true },
       false,
       { sessionID: "sess_1" },
     )
     expect(JSON.parse(ws.sent[2])).toMatchObject({ type: "response.create" })
-    expect(JSON.parse(ws.sent[2])).not.toHaveProperty("previous_response_id")
+    expect(JSON.parse(ws.sent[2])).toMatchObject({ previous_response_id: "resp_failed" })
     ws.serverMessage({ type: "response.completed", response: { id: "resp_next" } })
     await readAll(next)
   })
@@ -1563,7 +1676,7 @@ describe("websocket bridge", () => {
     const first = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "first", stream: true },
+      { model: "gpt-5.4-mini", input: "first", stream: true },
       false,
       { sessionID: "sess_1" },
     )
@@ -1575,7 +1688,7 @@ describe("websocket bridge", () => {
     const second = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "full context", stream: true, previous_response_id: "resp_missing" },
+      { model: "gpt-5.4-mini", input: "full context", stream: true, previous_response_id: "resp_missing" },
       false,
       { sessionID: "sess_1" },
     )
@@ -1594,12 +1707,12 @@ describe("websocket bridge", () => {
     expect(text).toContain("response.completed")
   })
 
-  test("does not retry previous_response_not_found when the request did not ask for continuation", async () => {
+  test("retries previous_response_not_found without previous_response_id for replay-safe input", async () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "full context", stream: true },
+      { model: "gpt-5.4-mini", input: "full context", stream: true },
       false,
       { sessionID: "sess_no_previous" },
     )
@@ -1613,8 +1726,18 @@ describe("websocket bridge", () => {
       error: { code: "previous_response_not_found", message: "Previous response not found" },
     })
 
-    await expect(reader.read()).rejects.toThrow(/without explicit previous_response_id/)
-    expect(ws.sent).toHaveLength(1)
+    expect(JSON.parse(ws.sent[1])).toMatchObject({
+      type: "response.create",
+      previous_response_id: null,
+    })
+    ws.serverMessage({ type: "response.completed", response: { id: "resp_recovered_without_previous" } })
+    let text = ""
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      text += new TextDecoder().decode(value)
+    }
+    expect(text).toContain("response.completed")
   })
 
   test("does not retry previous_response_not_found for tool-output-dependent input", async () => {
@@ -1622,7 +1745,7 @@ describe("websocket bridge", () => {
     const first = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "first", stream: true },
+      { model: "gpt-5.4-mini", input: "first", stream: true },
       false,
       { sessionID: "sess_1" },
     )
@@ -1635,7 +1758,7 @@ describe("websocket bridge", () => {
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
       {
-        model: "gpt-5.5",
+        model: "gpt-5.4-mini",
         input: [
           { type: "function_call_output", call_id: "call_1", output: "tool result" },
           { type: "message", role: "user", content: "continue" },
@@ -1659,7 +1782,7 @@ describe("websocket bridge", () => {
     const next = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "next", stream: true },
+      { model: "gpt-5.4-mini", input: "next", stream: true },
       false,
       { sessionID: "sess_1" },
     )
@@ -1675,7 +1798,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
     )
     const reader = response.body!.getReader()
@@ -1705,7 +1828,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
     )
     const reader = response.body!.getReader()
@@ -1724,7 +1847,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
     )
     const reader = response.body!.getReader()
@@ -1759,7 +1882,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
     )
     const reader = response.body!.getReader()
@@ -1785,7 +1908,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
     )
     const ws = MockWebSocket.instances[0]
@@ -1796,7 +1919,7 @@ describe("websocket bridge", () => {
       sequence_number: 0,
       response: {
         id: "resp_1",
-        model: "gpt-5.5",
+        model: "gpt-5.4-mini",
         service_tier: null,
         usage: {
           input_tokens: 1,
@@ -1826,7 +1949,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
     )
     const reader = response.body!.getReader()
@@ -1845,7 +1968,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
     )
     const ws = MockWebSocket.instances[0]
@@ -1877,7 +2000,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
     )
     const first = MockWebSocket.instances[0]
@@ -1899,7 +2022,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
     )
     const reader = response.body!.getReader()
@@ -1923,7 +2046,7 @@ describe("websocket bridge", () => {
     const first = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
     )
     const firstWs = MockWebSocket.instances[0]
@@ -1939,7 +2062,7 @@ describe("websocket bridge", () => {
     bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hello", stream: true },
+      { model: "gpt-5.4-mini", input: "hello", stream: true },
       false,
     )
     expect(MockWebSocket.instances).toHaveLength(2)
@@ -1951,7 +2074,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
     )
     const ws = MockWebSocket.instances[0]
@@ -1970,7 +2093,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
     )
     const ws = MockWebSocket.instances[0]
@@ -2003,7 +2126,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
     )
     const ws = MockWebSocket.instances[0]
@@ -2031,7 +2154,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
     )
     const ws = MockWebSocket.instances[0]
@@ -2062,7 +2185,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
     )
     const ws = MockWebSocket.instances[0]
@@ -2099,7 +2222,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
     )
     const ws = MockWebSocket.instances[0]
@@ -2123,7 +2246,7 @@ describe("websocket bridge", () => {
     const first = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
       {},
       firstController.signal,
@@ -2139,7 +2262,7 @@ describe("websocket bridge", () => {
     const second = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "again", stream: true },
+      { model: "gpt-5.4-mini", input: "again", stream: true },
       false,
     )
     expect(MockWebSocket.instances).toHaveLength(1)
@@ -2167,7 +2290,7 @@ describe("websocket bridge", () => {
     const response = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
       {},
       controller.signal,
@@ -2202,7 +2325,7 @@ describe("websocket bridge", () => {
       const first = bridgeWebSocket(
         `ws://127.0.0.1:${server.port}/responses`,
         apiKeyWebSocketHeaders("api-key-test"),
-        { model: "gpt-5.5", input: "hi", stream: true },
+        { model: "gpt-5.4-mini", input: "hi", stream: true },
         false,
         { sessionID: "sess_live", agent: "review", stablePrefixHash: "prefix_live" },
       )
@@ -2210,7 +2333,7 @@ describe("websocket bridge", () => {
       const second = bridgeWebSocket(
         `ws://127.0.0.1:${server.port}/responses`,
         apiKeyWebSocketHeaders("api-key-test"),
-        { model: "gpt-5.5", input: "again", stream: true },
+        { model: "gpt-5.4-mini", input: "again", stream: true },
         false,
         { sessionID: "sess_live", agent: "review", stablePrefixHash: "prefix_live" },
       )
@@ -2231,7 +2354,7 @@ describe("websocket bridge", () => {
       if (received[1]) expect(received[1].headers).toMatchObject({ "x-codex-turn-state": "turn_live" })
       expect(createBodies[0]).toMatchObject({
         type: "response.create",
-        model: "gpt-5.5",
+        model: "gpt-5.4-mini",
         instructions: "You are a helpful assistant.",
         input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
         store: false,
@@ -2242,8 +2365,7 @@ describe("websocket bridge", () => {
           "x-openai-subagent": "review",
         },
       })
-      expect(createBodies[1]).toMatchObject({ type: "response.create" })
-      expect(createBodies[1]).not.toHaveProperty("previous_response_id")
+      expect(createBodies[1]).toMatchObject({ type: "response.create", previous_response_id: "resp_live_hi" })
       expect(firstText).toContain("response.completed")
       expect(secondText).toContain("response.completed")
     } finally {
@@ -2256,6 +2378,7 @@ describe("websocket bridge", () => {
     const received: WireTurn[] = []
     const server = await listenWireWebSocket(received, {
       autoComplete: (body) => wireInputText(body) !== "before interruption",
+      responseCreatedID: (body) => (wireInputText(body) === "before interruption" ? "resp_interrupted_seed" : undefined),
     })
 
     try {
@@ -2263,13 +2386,17 @@ describe("websocket bridge", () => {
       const first = bridgeWebSocket(
         `ws://127.0.0.1:${server.port}/responses`,
         apiKeyWebSocketHeaders("api-key-test"),
-        { model: "gpt-5.5", input: "before interruption", stream: true },
+        { model: "gpt-5.4-mini", input: "before interruption", stream: true },
         false,
         { sessionID: "sess_live_mutation", agent: "review", stablePrefixHash: "prefix_before" },
         controller.signal,
       )
       await waitForWire(() => received[0]?.bodies.length === 1, "first live response.create")
       const firstReader = first.body!.getReader()
+      expect(parseSSEData(new TextDecoder().decode((await firstReader.read()).value))).toMatchObject({
+        type: "response.created",
+        response: { id: "resp_interrupted_seed" },
+      })
 
       controller.abort(new DOMException("Injected replacement", "AbortError"))
 
@@ -2278,6 +2405,9 @@ describe("websocket bridge", () => {
         () => received[0]?.messages.some((message) => message.type === "response.cancel") === true,
         "live response.cancel",
       )
+      expect(received[0].messages.find((message) => message.type === "response.cancel")).toMatchObject({
+        response_id: "resp_interrupted_seed",
+      })
 
       const injectedContext = "<hook-context>fresh runtime mutation</hook-context>"
       const replacementInput = [
@@ -2287,7 +2417,7 @@ describe("websocket bridge", () => {
       const second = bridgeWebSocket(
         `ws://127.0.0.1:${server.port}/responses`,
         apiKeyWebSocketHeaders("api-key-test"),
-        { model: "gpt-5.5", input: replacementInput, stream: true },
+        { model: "gpt-5.4-mini", input: replacementInput, stream: true },
         false,
         { sessionID: "sess_live_mutation", agent: "review", stablePrefixHash: "prefix_after" },
       )
@@ -2303,13 +2433,77 @@ describe("websocket bridge", () => {
       expect(createBodies[1]).toMatchObject({
         type: "response.create",
         input: replacementInput,
+        previous_response_id: "resp_interrupted_seed",
         prompt_cache_key: "prefix_after",
         client_metadata: {
           "x-codex-window-id": "sess_live_mutation",
           "x-openai-subagent": "review",
         },
       })
-      expect(createBodies[1]).not.toHaveProperty("previous_response_id")
+      expect(secondText).toContain("response.completed")
+    } finally {
+      resetPoolForTesting()
+      server.stop(true)
+    }
+  })
+
+  test("live websocket automatically reuses response id captured before cancel", async () => {
+    const received: WireTurn[] = []
+    const server = await listenWireWebSocket(received, {
+      autoComplete: (body) => wireInputText(body) !== "before cancel id",
+      responseCreatedID: (body) => (wireInputText(body) === "before cancel id" ? "resp_cancel_seed" : undefined),
+    })
+
+    try {
+      const controller = new AbortController()
+      const first = bridgeWebSocket(
+        `ws://127.0.0.1:${server.port}/responses`,
+        apiKeyWebSocketHeaders("api-key-test"),
+        { model: "gpt-5.4-mini", input: "before cancel id", stream: true },
+        false,
+        { sessionID: "sess_cancel_id", stablePrefixHash: "prefix_cancel" },
+        controller.signal,
+      )
+      const firstReader = first.body!.getReader()
+      const createdText = new TextDecoder().decode((await firstReader.read()).value)
+      const createdFrame = parseSSEData(createdText)
+      const capturedID = (createdFrame.response as { id?: string } | undefined)?.id
+      expect(createdFrame).toMatchObject({ type: "response.created", response: { id: "resp_cancel_seed" } })
+      expect(capturedID).toBe("resp_cancel_seed")
+
+      controller.abort(new DOMException("Captured response id", "AbortError"))
+
+      await expect(firstReader.read()).rejects.toThrow(/Captured response id|aborted/i)
+      await waitForWire(
+        () => received[0]?.messages.some((message) => message.type === "response.cancel") === true,
+        "response.cancel after captured id",
+      )
+      expect(received[0].messages.find((message) => message.type === "response.cancel")).toMatchObject({
+        response_id: "resp_cancel_seed",
+      })
+
+      const second = bridgeWebSocket(
+        `ws://127.0.0.1:${server.port}/responses`,
+        apiKeyWebSocketHeaders("api-key-test"),
+        { model: "gpt-5.4-mini", input: "after cancel id", stream: true },
+        false,
+        { sessionID: "sess_cancel_id", stablePrefixHash: "prefix_after_cancel" },
+      )
+      const secondText = await readAll(second)
+      const createBodies = received.flatMap((turn) => turn.bodies)
+
+      expect(createBodies).toHaveLength(2)
+      expect(createBodies[0]).toMatchObject({
+        type: "response.create",
+        input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "before cancel id" }] }],
+        prompt_cache_key: "prefix_cancel",
+      })
+      expect(createBodies[1]).toMatchObject({
+        type: "response.create",
+        input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "after cancel id" }] }],
+        previous_response_id: "resp_cancel_seed",
+        prompt_cache_key: "prefix_after_cancel",
+      })
       expect(secondText).toContain("response.completed")
     } finally {
       resetPoolForTesting()
@@ -2323,7 +2517,7 @@ describe("websocket bridge", () => {
       bridgeWebSocket(
         "wss://example.test/responses",
         apiKeyWebSocketHeaders("api-key-test"),
-        { model: "gpt-5.5", input: `hi ${index}`, stream: true },
+        { model: "gpt-5.4-mini", input: `hi ${index}`, stream: true },
         false,
         { sessionID: "sess_1", agent: "agent" },
       ),
@@ -2347,7 +2541,7 @@ describe("websocket bridge", () => {
     bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "hi", stream: true },
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
       false,
       {},
       controller.signal,
@@ -2365,7 +2559,7 @@ describe("websocket bridge", () => {
       bridgeWebSocket(
         "wss://example.test/responses",
         apiKeyWebSocketHeaders("api-key-test"),
-        { model: "gpt-5.5", input: `hi ${index}`, stream: true },
+        { model: "gpt-5.4-mini", input: `hi ${index}`, stream: true },
         false,
         { sessionID: "sess_1", agent: "agent" },
       ),

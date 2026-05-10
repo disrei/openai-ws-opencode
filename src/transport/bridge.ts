@@ -84,6 +84,7 @@ export function bridgeWebSocket(
       framesReceived: false,
       finalMessageOutputReceived: false,
       processedAckSent: false,
+      previousResponseNotFoundRetried: false,
       idleTimer: null,
       metadata: {},
     }

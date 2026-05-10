@@ -62,7 +62,7 @@ export function prepareBody(
   isOAuth: boolean,
   context: TransportContext = {},
 ): Record<string, unknown> {
-  const { stream_options: _streamOptions, background: _background, ...wsBody } = requestBody
+  const { stream_options: _streamOptions, ...wsBody } = requestBody
 
   if (!wsBody.instructions) wsBody.instructions = "You are a helpful assistant."
   if (wsBody.input !== undefined) wsBody.input = normalizeInput(wsBody.input)

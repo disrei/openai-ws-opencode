@@ -1,7 +1,9 @@
 import crypto from "node:crypto"
 import {
+  CODEX_WS_URL,
   OPENAI_MODEL_HEADER,
   OPENAI_WS_INSTALLATION_ID_ENV,
+  RESPONSE_PROCESSED_DISABLE_ENV,
   RESPONSE_PROCESSED_ENV,
   X_CODEX_INSTALLATION_ID_HEADER,
   X_CODEX_TURN_STATE_HEADER,
@@ -30,6 +32,7 @@ export interface PendingRequest {
   framesReceived: boolean
   finalMessageOutputReceived: boolean
   processedAckSent: boolean
+  previousResponseNotFoundRetried: boolean
   idleTimer: ReturnType<typeof setTimeout> | null
   metadata: PendingMetadata
 }
@@ -221,16 +224,6 @@ function closeSocket(conn: PooledConnection, code: number, reason: string) {
 }
 
 function terminalRelease(conn: PooledConnection) {
-  if (conn.turnState) {
-    finalizePending(conn.pending)
-    conn.pending = null
-    conn.activeSessionID = undefined
-    conn.activeAgent = undefined
-    conn.busy = false
-    removeAndDrain(conn)
-    closeSocket(conn, 1000, "turn complete")
-    return
-  }
   release(conn)
   drainQueue(conn.scopeKey)
 }
@@ -393,9 +386,19 @@ function wrappedWebSocketError(frame: Record<string, unknown>): Error | undefine
   )
 }
 
+function isCodexConnection(conn: PooledConnection): boolean {
+  return conn.wsUrl === CODEX_WS_URL || conn.wsUrl.includes("chatgpt.com/backend-api/codex")
+}
+
+function shouldSendResponseProcessed(conn: PooledConnection): boolean {
+  if (process.env[RESPONSE_PROCESSED_DISABLE_ENV] === "1") return false
+  if (process.env[RESPONSE_PROCESSED_ENV] === "1") return true
+  return isCodexConnection(conn)
+}
+
 function sendResponseProcessed(conn: PooledConnection, pending: PendingRequest, eventType: string) {
   if (eventType !== "response.completed") return
-  if (process.env[RESPONSE_PROCESSED_ENV] !== "1") return
+  if (!shouldSendResponseProcessed(conn)) return
   if (pending.processedAckSent || !pending.metadata.responseId) return
   try {
     conn.ws?.send(JSON.stringify({ type: "response.processed", response_id: pending.metadata.responseId }))
@@ -403,6 +406,58 @@ function sendResponseProcessed(conn: PooledConnection, pending: PendingRequest, 
   } catch (error) {
     conn.lastErrorMessage = error instanceof Error ? error.message : String(error)
   }
+}
+
+function websocketErrorCode(frame: Record<string, unknown>): string | undefined {
+  const error = frame.error && typeof frame.error === "object" ? (frame.error as Record<string, unknown>) : {}
+  return typeof error.code === "string" ? error.code : typeof frame.code === "string" ? frame.code : undefined
+}
+
+function hasReplaySafeInput(body: Record<string, unknown>): boolean {
+  const input = body.input
+  if (typeof input === "string") return input.length > 0
+  if (!Array.isArray(input)) return false
+  return input.length > 0 && input.every((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return false
+    const value = item as Record<string, unknown>
+    return value.type === "message"
+  })
+}
+
+function clearLastResponseID(conn: PooledConnection) {
+  conn.lastResponseID = undefined
+  lastResponseIDByContext.delete(conn.contextKey)
+}
+
+function handlePreviousResponseNotFound(conn: PooledConnection, pending: PendingRequest): boolean {
+  clearLastResponseID(conn)
+  pending.metadata.responseId = undefined
+  if (pending.previousResponseNotFoundRetried) {
+    fail(conn, new Error("OpenAI WebSocket previous_response_not_found after retrying without previous_response_id"), true)
+    return true
+  }
+  if (!hasReplaySafeInput(pending.body)) {
+    fail(
+      conn,
+      new Error(
+        "OpenAI WebSocket previous_response_not_found; cannot safely retry without previous_response_id because request input does not contain replayable message context",
+      ),
+      true,
+    )
+    return true
+  }
+  pending.previousResponseNotFoundRetried = true
+  pending.body.previous_response_id = null
+  pending.sent = false
+  pending.writeCommitted = false
+  pending.framesReceived = false
+  pending.finalMessageOutputReceived = false
+  pending.processedAckSent = false
+  clearPendingTimer(pending)
+  if (conn.ws?.readyState !== readyState.OPEN || !sendPending(conn)) {
+    fail(conn, new Error("OpenAI WebSocket previous_response_not_found; retry without previous_response_id could not be sent"), true)
+  }
+  return true
 }
 
 function enqueueSSE(conn: PooledConnection, frame: Record<string, unknown>) {
@@ -415,6 +470,8 @@ function enqueueSSE(conn: PooledConnection, frame: Record<string, unknown>) {
   if (isFinalMessageOutputItem(frame)) pending.finalMessageOutputReceived = true
   const mappedError = wrappedWebSocketError(frame)
   if (mappedError) {
+    if (websocketErrorCode(frame) === "previous_response_not_found" && handlePreviousResponseNotFound(conn, pending)) return
+    clearLastResponseID(conn)
     fail(conn, mappedError, true)
     return
   }
@@ -432,9 +489,12 @@ function enqueueSSE(conn: PooledConnection, frame: Record<string, unknown>) {
     try {
       pending.controller.close()
     } catch {}
-    if (pending.metadata.responseId) {
+    if (eventType === "response.completed" && pending.metadata.responseId) {
       conn.lastResponseID = pending.metadata.responseId
       lastResponseIDByContext.set(conn.contextKey, pending.metadata.responseId)
+    } else {
+      clearLastResponseID(conn)
+      pending.metadata.responseId = undefined
     }
     terminalRelease(conn)
   }
@@ -446,10 +506,7 @@ function finishAfterFinalOutputSocketClose(conn: PooledConnection, pending: Pend
   try {
     pending.controller.close()
   } catch {}
-  if (pending.metadata.responseId) {
-    conn.lastResponseID = pending.metadata.responseId
-    lastResponseIDByContext.set(conn.contextKey, pending.metadata.responseId)
-  }
+  clearLastResponseID(conn)
   conn.pending = null
   conn.busy = false
   conn.activeSessionID = undefined

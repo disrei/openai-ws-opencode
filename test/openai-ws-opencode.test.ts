@@ -14,6 +14,7 @@ import {
   CLIENT_ID,
   CODEX_API_ENDPOINT,
   CODEX_ORIGINATOR,
+  CODEX_WS_URL,
   INTERNAL_AGENT_HEADER,
   INTERNAL_MODEL_HEADER,
   INTERNAL_PREFIX_HASH_HEADER,
@@ -21,6 +22,7 @@ import {
   OPENAI_WS_BETA,
   OPENAI_WS_INSTALLATION_ID_ENV,
   PROVIDER_ID,
+  RESPONSE_PROCESSED_DISABLE_ENV,
   RESPONSE_PROCESSED_ENV,
   USER_AGENT,
 } from "../src/constants.js"
@@ -270,6 +272,7 @@ function unmaskWirePayload(payload: Uint8Array, mask: Uint8Array): Buffer {
 const originalXdgCacheHome = process.env.XDG_CACHE_HOME
 const originalInstallationID = process.env[OPENAI_WS_INSTALLATION_ID_ENV]
 const originalResponseProcessed = process.env[RESPONSE_PROCESSED_ENV]
+const originalResponseProcessedDisable = process.env[RESPONSE_PROCESSED_DISABLE_ENV]
 const originalOpenAIOrganization = process.env.OPENAI_ORGANIZATION
 const originalOpenAIProject = process.env.OPENAI_PROJECT
 const skipCatalogEnv = "OPENAI_WS_OPENCODE_SKIP_CATALOG"
@@ -288,6 +291,8 @@ afterEach(() => {
   else process.env[OPENAI_WS_INSTALLATION_ID_ENV] = originalInstallationID
   if (originalResponseProcessed === undefined) delete process.env[RESPONSE_PROCESSED_ENV]
   else process.env[RESPONSE_PROCESSED_ENV] = originalResponseProcessed
+  if (originalResponseProcessedDisable === undefined) delete process.env[RESPONSE_PROCESSED_DISABLE_ENV]
+  else process.env[RESPONSE_PROCESSED_DISABLE_ENV] = originalResponseProcessedDisable
   if (originalOpenAIOrganization === undefined) delete process.env.OPENAI_ORGANIZATION
   else process.env.OPENAI_ORGANIZATION = originalOpenAIOrganization
   if (originalOpenAIProject === undefined) delete process.env.OPENAI_PROJECT
@@ -552,6 +557,7 @@ describe("body and headers", () => {
     )
     expect(api).toMatchObject({
       instructions: "You are a helpful assistant.",
+      background: true,
       stream: true,
       store: false,
       service_tier: "priority",
@@ -565,7 +571,6 @@ describe("body and headers", () => {
       },
     })
     expect(api).not.toHaveProperty("stream_options")
-    expect(api).not.toHaveProperty("background")
 
     const oauth = prepareBody({ stream: true, max_output_tokens: 10, max_tokens: 10 }, true)
     expect(oauth.store).toBe(false)
@@ -1008,7 +1013,7 @@ describe("websocket bridge", () => {
   test("transport defaults support retries and stream idle timeouts without client heartbeat", () => {
     expect(transportConfig.connectTimeoutMs).toBeGreaterThan(0)
     expect(transportConfig.maxReconnectAttempts).toBeGreaterThan(0)
-    expect(transportConfig.streamIdleTimeoutMs).toBeGreaterThan(0)
+    expect(transportConfig.streamIdleTimeoutMs).toBe(600_000)
     expect(transportConfig).not.toHaveProperty("heartbeatIntervalMs")
     expect(transportConfig).not.toHaveProperty("pongTimeoutMs")
   })
@@ -1048,7 +1053,7 @@ describe("websocket bridge", () => {
     })
   })
 
-  test("captures turn-state upgrade metadata and sends it on the next turn", async () => {
+  test("keeps turn-state sockets reusable and sends continuation on the next turn", async () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const first = bridgeWebSocket(
       "wss://example.test/responses",
@@ -1074,7 +1079,7 @@ describe("websocket bridge", () => {
     firstWs.serverMessage({ type: "response.completed", response: { id: "resp_1" } })
     const firstReader = first.body!.getReader()
     while (!(await firstReader.read()).done) {}
-    expect(firstWs.terminateCount).toBeGreaterThan(0)
+    expect(firstWs.terminateCount).toBe(0)
 
     const second = bridgeWebSocket(
       "wss://example.test/responses",
@@ -1083,14 +1088,8 @@ describe("websocket bridge", () => {
       false,
       { sessionID: "sess_1", agent: "review", stablePrefixHash: "prefix_1" },
     )
-    const secondWs = MockWebSocket.instances[1]
-    expect(secondWs.options.headers).toMatchObject({
-      "x-codex-turn-state": "turn_1",
-      "x-codex-window-id": "sess_1",
-      "x-openai-subagent": "review",
-    })
-    secondWs.open()
-    expect(JSON.parse(secondWs.sent[0])).toMatchObject({
+    expect(MockWebSocket.instances).toHaveLength(1)
+    expect(JSON.parse(firstWs.sent[1])).toMatchObject({
       type: "response.create",
       previous_response_id: "resp_1",
       prompt_cache_key: "prefix_1",
@@ -1099,7 +1098,7 @@ describe("websocket bridge", () => {
         "x-openai-subagent": "review",
       },
     })
-    secondWs.serverMessage({ type: "response.completed", response: { id: "resp_2" } })
+    firstWs.serverMessage({ type: "response.completed", response: { id: "resp_2" } })
     const secondReader = second.body!.getReader()
     while (!(await secondReader.read()).done) {}
   })
@@ -1122,6 +1121,42 @@ describe("websocket bridge", () => {
       expect.objectContaining({ type: "response.create" }),
       { type: "response.processed", response_id: "resp_done" },
     ])
+  })
+
+  test("acknowledges completed Codex responses by default", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const response = bridgeWebSocket(
+      CODEX_WS_URL,
+      oauthWebSocketHeaders("access-test", "acct_1"),
+      { model: "gpt-5.3-codex", input: "hi", stream: true },
+      true,
+    )
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    ws.serverMessage({ type: "response.completed", response: { id: "resp_done" } })
+    const reader = response.body!.getReader()
+    while (!(await reader.read()).done) {}
+    expect(sentFrames(ws)).toEqual([
+      expect.objectContaining({ type: "response.create" }),
+      { type: "response.processed", response_id: "resp_done" },
+    ])
+  })
+
+  test("can disable default Codex response.processed acknowledgements", async () => {
+    process.env[RESPONSE_PROCESSED_DISABLE_ENV] = "1"
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const response = bridgeWebSocket(
+      CODEX_WS_URL,
+      oauthWebSocketHeaders("access-test", "acct_1"),
+      { model: "gpt-5.3-codex", input: "hi", stream: true },
+      true,
+    )
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    ws.serverMessage({ type: "response.completed", response: { id: "resp_done" } })
+    const reader = response.body!.getReader()
+    while (!(await reader.read()).done) {}
+    expect(sentFrames(ws)).toEqual([expect.objectContaining({ type: "response.create" })])
   })
 
   test("maps wrapped websocket errors to stream errors", async () => {
@@ -1182,6 +1217,131 @@ describe("websocket bridge", () => {
       const text = await readAll(response)
       expect(text).toContain(type)
     }
+  })
+
+  test("clears continuation after failed response events", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const first = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "first", stream: true },
+      false,
+      { sessionID: "sess_1" },
+    )
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    ws.serverMessage({ type: "response.completed", response: { id: "resp_completed" } })
+    await readAll(first)
+
+    const failed = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "failed", stream: true },
+      false,
+      { sessionID: "sess_1" },
+    )
+    ws.serverMessage({ type: "response.failed", response: { id: "resp_failed" } })
+    await readAll(failed)
+
+    const next = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "next", stream: true },
+      false,
+      { sessionID: "sess_1" },
+    )
+    expect(JSON.parse(ws.sent[2])).toMatchObject({ type: "response.create" })
+    expect(JSON.parse(ws.sent[2])).not.toHaveProperty("previous_response_id")
+    ws.serverMessage({ type: "response.completed", response: { id: "resp_next" } })
+    await readAll(next)
+  })
+
+  test("retries previous_response_not_found without previous_response_id for replay-safe input", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const first = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "first", stream: true },
+      false,
+      { sessionID: "sess_1" },
+    )
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    ws.serverMessage({ type: "response.completed", response: { id: "resp_missing" } })
+    await readAll(first)
+
+    const second = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "full context", stream: true },
+      false,
+      { sessionID: "sess_1" },
+    )
+    expect(JSON.parse(ws.sent[1])).toMatchObject({ previous_response_id: "resp_missing" })
+    ws.serverMessage({
+      type: "error",
+      status: 400,
+      error: { code: "previous_response_not_found", message: "Previous response not found" },
+    })
+    expect(JSON.parse(ws.sent[2])).toMatchObject({
+      type: "response.create",
+      previous_response_id: null,
+    })
+    ws.serverMessage({ type: "response.completed", response: { id: "resp_recovered" } })
+    const text = await readAll(second)
+    expect(text).toContain("response.completed")
+  })
+
+  test("does not retry previous_response_not_found for tool-output-dependent input", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const first = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "first", stream: true },
+      false,
+      { sessionID: "sess_1" },
+    )
+    const firstWs = MockWebSocket.instances[0]
+    firstWs.open()
+    firstWs.serverMessage({ type: "response.completed", response: { id: "resp_missing" } })
+    await readAll(first)
+
+    const toolOutput = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      {
+        model: "gpt-5.5",
+        input: [
+          { type: "function_call_output", call_id: "call_1", output: "tool result" },
+          { type: "message", role: "user", content: "continue" },
+        ],
+        stream: true,
+      },
+      false,
+      { sessionID: "sess_1" },
+    )
+    const reader = toolOutput.body!.getReader()
+    expect(JSON.parse(firstWs.sent[1])).toMatchObject({ previous_response_id: "resp_missing" })
+    firstWs.serverMessage({
+      type: "error",
+      status: 400,
+      error: { code: "previous_response_not_found", message: "Previous response not found" },
+    })
+    await expect(reader.read()).rejects.toThrow(/cannot safely retry without previous_response_id/)
+    expect(firstWs.sent).toHaveLength(2)
+
+    const next = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "next", stream: true },
+      false,
+      { sessionID: "sess_1" },
+    )
+    const nextWs = MockWebSocket.instances.at(-1)!
+    nextWs.open()
+    expect(JSON.parse(nextWs.sent[0])).not.toHaveProperty("previous_response_id")
+    nextWs.serverMessage({ type: "response.completed", response: { id: "resp_next" } })
+    await readAll(next)
   })
 
   test("rejects unexpected binary websocket events", async () => {
@@ -1513,7 +1673,7 @@ describe("websocket bridge", () => {
     const reader = response.body!.getReader()
     expect(new TextDecoder().decode((await reader.read()).value)).toContain("morph-mcp_edit_file")
 
-    vi.advanceTimersByTime(300_000)
+    vi.advanceTimersByTime(600_000)
     await Promise.resolve()
 
     await expect(reader.read()).rejects.toThrow(/idle timeout waiting for websocket after response\.output_item\.done/)
@@ -1534,7 +1694,7 @@ describe("websocket bridge", () => {
     ws.open()
     const reader = response.body!.getReader()
 
-    vi.advanceTimersByTime(299_999)
+    vi.advanceTimersByTime(599_999)
     await Promise.resolve()
     let pending = true
     const pendingRead = reader.read().then((result) => {
@@ -1567,11 +1727,11 @@ describe("websocket bridge", () => {
     const reader = response.body!.getReader()
     expect(new TextDecoder().decode((await reader.read()).value)).toContain("response.created")
 
-    vi.advanceTimersByTime(299_999)
+    vi.advanceTimersByTime(599_999)
     await Promise.resolve()
     ws.serverMessage({ type: "response.in_progress", sequence_number: 1, response: { id: "resp_safe" } })
     expect(new TextDecoder().decode((await reader.read()).value)).toContain("response.in_progress")
-    vi.advanceTimersByTime(299_999)
+    vi.advanceTimersByTime(599_999)
     await Promise.resolve()
     let pending = false
     const pendingRead = reader.read().then((result) => {

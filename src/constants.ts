@@ -25,6 +25,7 @@ export const X_REASONING_INCLUDED_HEADER = "x-reasoning-included"
 export const OPENAI_MODEL_HEADER = "openai-model"
 export const OPENAI_WS_INSTALLATION_ID_ENV = "OPENAI_WS_OPENCODE_INSTALLATION_ID"
 export const RESPONSE_PROCESSED_ENV = "OPENAI_WS_OPENCODE_RESPONSE_PROCESSED"
+export const RESPONSE_PROCESSED_DISABLE_ENV = "OPENAI_WS_OPENCODE_RESPONSE_PROCESSED_DISABLE"
 
 export const INTERNAL_SESSION_HEADER = "x-openai-ws-opencode-session-id"
 export const INTERNAL_AGENT_HEADER = "x-openai-ws-opencode-agent"

@@ -60,6 +60,7 @@ export interface PooledConnection {
   contextKey: string
   busy: boolean
   warm: boolean
+  staleAuth: boolean
   pending: PendingRequest | null
   activeSessionID?: string
   lastSessionID?: string
@@ -79,6 +80,8 @@ export interface PooledConnection {
   lastCloseCode?: number
   lastCloseReason?: string
   lastErrorMessage?: string
+  retryAfterMs?: number
+  frameCarryover: string
   idleTimer: ReturnType<typeof setTimeout> | null
   connectTimer: ReturnType<typeof setTimeout> | null
   retryTimer: ReturnType<typeof setTimeout> | null
@@ -219,12 +222,15 @@ function remove(conn: PooledConnection) {
   detach(conn)
 }
 
-function retryDelay(attempt: number): number {
+function retryDelay(attempt: number, retryAfterMs?: number): number {
+  if (retryAfterMs !== undefined) return Math.min(retryAfterMs, transportConfig.retryAfterMaxDelayMs)
   const exponential = Math.min(
     transportConfig.reconnectMaxDelayMs,
     transportConfig.reconnectBaseDelayMs * 2 ** Math.max(0, attempt - 1),
   )
-  return exponential
+  const jitterRatio = Math.max(0, Math.min(1, transportConfig.reconnectJitterRatio))
+  if (jitterRatio === 0) return exponential
+  return Math.ceil(exponential * (1 - jitterRatio * Math.random()))
 }
 
 function closeSocket(conn: PooledConnection, code: number, reason: string) {
@@ -266,8 +272,14 @@ function release(conn: PooledConnection) {
   conn.activeAgent = undefined
   conn.busy = false
   conn.reconnectAttempts = 0
+  conn.frameCarryover = ""
   clearTimer(conn.idleTimer)
   conn.idleTimer = null
+  if (conn.staleAuth) {
+    removeAndDrain(conn)
+    closeSocket(conn, 1000, "auth changed")
+    return
+  }
   if (!conn.warm) {
     conn.idleTimer = unrefTimer(
       setTimeout(() => {
@@ -367,21 +379,61 @@ function schedulePendingIdleTimeout(conn: PooledConnection, reason: string) {
   )
 }
 
-function parseFrames(data: unknown): Array<Record<string, unknown>> {
-  const text = typeof data === "string" ? data : Buffer.isBuffer(data) ? data.toString("utf8") : String(data)
-  const lines = text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-  const candidates = lines.length ? lines : [text]
+function decodeFrameData(data: unknown): string {
+  if (typeof data === "string") return data
+  if (Buffer.isBuffer(data)) return data.toString("utf8")
+  if (data instanceof ArrayBuffer) return Buffer.from(data).toString("utf8")
+  if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf8")
+  return String(data)
+}
+
+function extractJsonValueLength(source: string): number {
+  const first = source.charCodeAt(0)
+  if (first !== 0x7b && first !== 0x5b) return -1
+
+  let depth = 0
+  let inString = false
+  let escape = false
+  for (let index = 0; index < source.length; index++) {
+    const char = source.charCodeAt(index)
+    if (inString) {
+      if (escape) escape = false
+      else if (char === 0x5c) escape = true
+      else if (char === 0x22) inString = false
+      continue
+    }
+    if (char === 0x22) inString = true
+    else if (char === 0x7b || char === 0x5b) depth += 1
+    else if (char === 0x7d || char === 0x5d) {
+      depth -= 1
+      if (depth === 0) return index + 1
+    }
+  }
+  return -1
+}
+
+function parseFrames(data: unknown, carryover = ""): { frames: Array<Record<string, unknown>>; carryover: string } {
+  let buffer = carryover + decodeFrameData(data)
   const frames: Array<Record<string, unknown>> = []
-  for (const candidate of candidates) {
+
+  while (buffer.length > 0) {
+    buffer = buffer.replace(/^\s+/, "")
+    if (!buffer) break
+    const consumed = extractJsonValueLength(buffer)
+    if (consumed < 0) break
+    const candidate = buffer.slice(0, consumed)
+    buffer = buffer.slice(consumed)
     try {
       const parsed = JSON.parse(candidate)
-      if (parsed && typeof parsed === "object") frames.push(parsed as Record<string, unknown>)
+      if (Array.isArray(parsed)) {
+        frames.push(...parsed.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item)))
+      } else if (parsed && typeof parsed === "object") {
+        frames.push(parsed as Record<string, unknown>)
+      }
     } catch {}
   }
-  return frames
+
+  return { frames, carryover: buffer }
 }
 
 function numberFrom(value: unknown): number | undefined {
@@ -519,6 +571,7 @@ function handlePreviousResponseNotFound(conn: PooledConnection, pending: Pending
   pending.framesReceived = false
   pending.finalMessageOutputReceived = false
   pending.processedAckSent = false
+  conn.frameCarryover = ""
   clearPendingTimer(pending)
   if (conn.ws?.readyState !== readyState.OPEN || !sendPending(conn)) {
     fail(conn, new Error("OpenAI WebSocket previous_response_not_found; retry without previous_response_id could not be sent"), true)
@@ -639,8 +692,19 @@ function closeReasonFrom(codeOrEvent: unknown, reason: unknown): string | undefi
   return undefined
 }
 
+function parseRetryAfterMs(source: unknown): number | undefined {
+  const raw = headerValue(source, "retry-after")
+  if (!raw) return undefined
+  const seconds = Number(raw)
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000
+  const date = Date.parse(raw)
+  if (!Number.isNaN(date)) return Math.max(0, date - Date.now())
+  return undefined
+}
+
 function connect(conn: PooledConnection) {
   const generation = ++conn.generation
+  conn.frameCarryover = ""
   clearTimer(conn.retryTimer)
   conn.retryTimer = null
   clearTimer(conn.connectTimer)
@@ -679,7 +743,9 @@ function connect(conn: PooledConnection) {
       fail(conn, new Error("unexpected binary websocket event"), true)
       return
     }
-    for (const frame of parseFrames(data)) enqueueSSE(conn, frame)
+    const parsed = parseFrames(data, conn.frameCarryover)
+    conn.frameCarryover = parsed.carryover
+    for (const frame of parsed.frames) enqueueSSE(conn, frame)
   }
 
   const handleError = (error: unknown) => {
@@ -701,6 +767,7 @@ function connect(conn: PooledConnection) {
     if (generation !== conn.generation) return
     const status = numberFrom((response as { statusCode?: unknown } | undefined)?.statusCode)
     if (status !== undefined) conn.lastCloseCode = status
+    conn.retryAfterMs = parseRetryAfterMs(response)
     conn.lastCloseReason = `websocket handshake failed${status !== undefined ? ` with status ${status}` : ""}`
     handleSocketLoss(conn)
   }
@@ -764,7 +831,10 @@ function handleSocketLoss(conn: PooledConnection) {
     conn.generation++
     pending.sent = false
     pending.writeCommitted = false
+    conn.frameCarryover = ""
     clearPendingTimer(pending)
+    const retryAfterMs = conn.retryAfterMs
+    conn.retryAfterMs = undefined
     const priorWs = conn.ws
     detach(conn)
     try {
@@ -779,7 +849,7 @@ function handleSocketLoss(conn: PooledConnection) {
         conn.retryTimer = null
         if (!connectionPool.includes(conn) || !conn.pending || conn.pending.done || conn.pending.sent || conn.pending.writeCommitted) return
         connect(conn)
-      }, retryDelay(conn.reconnectAttempts)),
+      }, retryDelay(conn.reconnectAttempts, retryAfterMs)),
     )
     return
   }
@@ -799,6 +869,7 @@ function create(wsUrl: string, headers: Record<string, string>, context: Transpo
     contextKey: key,
     busy: false,
     warm,
+    staleAuth: false,
     pending: null,
     lastResponseID: lastResponseIDByContext.get(key),
     generation: 0,
@@ -808,6 +879,7 @@ function create(wsUrl: string, headers: Record<string, string>, context: Transpo
     idleTimer: null,
     connectTimer: null,
     retryTimer: null,
+    frameCarryover: "",
     detach: null,
   }
   connectionPool.push(conn)
@@ -816,6 +888,7 @@ function create(wsUrl: string, headers: Record<string, string>, context: Transpo
 }
 
 function isReusable(conn: PooledConnection, key: string, context: TransportContext, now: number): boolean {
+  if (conn.staleAuth) return false
   if (conn.busy) return false
   if (conn.scopeKey !== key) return false
   if (conn.ws?.readyState !== readyState.OPEN && conn.ws?.readyState !== readyState.CONNECTING) return false
@@ -828,6 +901,17 @@ function isReusable(conn: PooledConnection, key: string, context: TransportConte
 
 function activeCount(key: string): number {
   return connectionPool.filter((conn) => conn.scopeKey === key && (conn.busy || conn.ws?.readyState === readyState.CONNECTING)).length
+}
+
+export function invalidateStaleAuthConnections(wsUrl: string, headers: Record<string, string>) {
+  const currentHash = authScopeHash(headers)
+  for (const conn of [...connectionPool]) {
+    if (conn.wsUrl !== wsUrl || conn.scopeHash === currentHash) continue
+    conn.staleAuth = true
+    if (conn.busy) continue
+    removeAndDrain(conn)
+    closeSocket(conn, 1000, "auth changed")
+  }
 }
 
 function cleanupStaleConnections(key: string, now: number) {
@@ -847,6 +931,7 @@ function cleanupStaleConnections(key: string, now: number) {
 }
 
 function reserveConnection(wsUrl: string, headers: Record<string, string>, context: TransportContext): PooledConnection | null {
+  invalidateStaleAuthConnections(wsUrl, headers)
   const key = contextScopeKey(wsUrl, headers, context)
   const now = Date.now()
   cleanupStaleConnections(key, now)
@@ -931,6 +1016,7 @@ export function acquireConnection(
 }
 
 export function ensureWarmConnection(wsUrl: string, headers: Record<string, string>) {
+  invalidateStaleAuthConnections(wsUrl, headers)
   const key = contextScopeKey(wsUrl, headers, {})
   const now = Date.now()
   cleanupStaleConnections(key, now)

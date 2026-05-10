@@ -5,6 +5,7 @@ export {
   connectionPool,
   readyState,
   ensureWarmConnection,
+  invalidateStaleAuthConnections,
   resetPoolForTesting,
   resetWebSocketConstructorForTesting,
   setWebSocketConstructorForTesting,

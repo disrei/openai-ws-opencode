@@ -12,7 +12,7 @@ export const OPENAI_WS_URL = "wss://api.openai.com/v1/responses"
 export const CODEX_WS_URL = "wss://chatgpt.com/backend-api/codex/responses"
 export const OPENAI_WS_BETA = "responses_websockets=2026-02-06"
 export const CODEX_ORIGINATOR = "opencode"
-export const USER_AGENT = "openai-ws-opencode/0.1.20"
+export const USER_AGENT = "openai-ws-opencode/0.1.22"
 export const CODEX_OAUTH_SCOPE = "openid profile email offline_access"
 export const OAUTH_PORT = 1455
 

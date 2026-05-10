@@ -1,6 +1,6 @@
 import { OPENAI_API_BASE, PROVIDER_ID } from "../constants.js"
 import type { CodexModelInfo } from "./catalog.js"
-import { makeVariants, OPENAI_WS_MODELS, type OpenAIWSModelDef } from "./defaults.js"
+import { codexLimit, makeVariants, OPENAI_WS_MODELS, type OpenAIWSModelDef } from "./defaults.js"
 
 export type ProviderModelConfig = {
   id: string
@@ -64,7 +64,7 @@ export function modelToProviderConfig(id: string, model: OpenAIWSModelDef): Prov
       interleaved: false,
     },
     cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-    limit: model.limit,
+    limit: { ...model.limit },
     status: "active",
     options: {},
     headers: {},
@@ -90,7 +90,7 @@ function fallbackModelFor(id: string): OpenAIWSModelDef {
     name: `${id} (WebSocket)`,
     reasoning: true,
     temperature: false,
-    limit: { context: 272000, output: 128000 },
+    limit: codexLimit(),
     variants: {},
     ...(id.includes("codex") ? { family: "gpt-codex" } : id.endsWith("-pro") ? { family: "gpt-pro" } : {}),
   }
@@ -98,19 +98,10 @@ function fallbackModelFor(id: string): OpenAIWSModelDef {
   return result
 }
 
-function resolvedCodexContextWindow(model: CodexModelInfo): number | undefined {
-  const context = model.context_window ?? model.max_context_window
-  if (!context) return undefined
-  if (model.effective_context_window_percent != null) return Math.floor((context * model.effective_context_window_percent) / 100)
-  return context
-}
-
 function modelFromCodexCatalog(model: CodexModelInfo): [string, OpenAIWSModelDef] | undefined {
   const id = model.slug
   if (!id) return undefined
   if (model.prefer_websockets !== true && !isOpenAIWSCandidate(id)) return undefined
-  const context = resolvedCodexContextWindow(model)
-  if (!context) return undefined
   const efforts = (model.supported_reasoning_levels ?? [])
     .map((level) => level.effort)
     .filter((effort): effort is string => Boolean(effort))
@@ -119,10 +110,7 @@ function modelFromCodexCatalog(model: CodexModelInfo): [string, OpenAIWSModelDef
     name: `${model.display_name ?? id} (WebSocket)`,
     reasoning,
     temperature: false,
-    limit: {
-      context,
-      output: 128000,
-    },
+    limit: codexLimit(),
     variants: reasoning ? makeVariants(efforts, Boolean(model.supports_reasoning_summaries)) : {},
     ...(id.includes("codex") ? { family: "gpt-codex" } : id.endsWith("-pro") ? { family: "gpt-pro" } : {}),
   }
@@ -200,7 +188,7 @@ export function modelToOpenCodeConfig(model: OpenAIWSModelDef): OpenCodeConfigMo
     reasoning: model.reasoning,
     temperature: model.temperature,
     tool_call: true,
-    limit: model.limit,
+    limit: { ...model.limit },
     modalities: {
       input: ["text", "image"],
       output: ["text"],

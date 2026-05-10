@@ -8,9 +8,12 @@ import {
   type PendingRequest,
   type PooledConnection,
 } from "./pool.js"
+import { transportConfig } from "./config.js"
 import type { TransportContext } from "./headers.js"
 
 type FallbackFetch = (signal: AbortSignal) => Promise<Response>
+
+const encoder = new TextEncoder()
 
 function abortPending(conn: PooledConnection, error: Error) {
   const pending = conn.pending
@@ -64,6 +67,17 @@ export function bridgeWebSocket(
   let finalized = false
   let fallbackStarted = false
   let streamController: ReadableStreamDefaultController<Uint8Array> | undefined
+
+  const enqueuePreFirstBytePing = () => {
+    const ping = transportConfig.preFirstBytePing
+    if (!ping || !streamController) return
+    queueMicrotask(() => {
+      if (finalized || signal?.aborted || !streamController || conn?.pending?.framesReceived) return
+      try {
+        streamController.enqueue(encoder.encode(ping))
+      } catch {}
+    })
+  }
 
   const cleanupAbort = () => {
     if (signal) signal.removeEventListener("abort", onAbort)
@@ -181,6 +195,7 @@ export function bridgeWebSocket(
         controller.error(abortError(signal))
         return
       }
+      enqueuePreFirstBytePing()
       if (signal) signal.addEventListener("abort", onAbort, { once: true })
       const acquired = acquireConnection(wsUrl, headers, context, acquisitionController.signal)
       if (acquired instanceof Promise) {

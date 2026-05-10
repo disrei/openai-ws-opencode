@@ -13,11 +13,11 @@ import {
 import { oauthMethods } from "./auth/oauth.js"
 import { extractAccountId, refreshAccessToken, tokenExpiry, type StoredOAuthAuth } from "./auth/tokens.js"
 import { fetchCodexCatalog, fetchOpenAIModelIds } from "./models/catalog.js"
-import { OPENAI_WS_MODELS } from "./models/defaults.js"
+import { CODEX_EFFECTIVE_CONTEXT_WINDOW, CODEX_OUTPUT_TOKEN_LIMIT, OPENAI_WS_MODELS } from "./models/defaults.js"
 import { resolveModelsForApiKey, resolveModelsForOAuth } from "./models/resolve.js"
 import { prepareHttpFallbackBody } from "./transport/body.js"
 import { bridgeWebSocket } from "./transport/bridge.js"
-import { closeConnections, ensureWarmConnection } from "./transport/pool.js"
+import { closeConnections, ensureWarmConnection, invalidateStaleAuthConnections } from "./transport/pool.js"
 import { extractTransportContext, httpAuthHeaders, transportIdentity } from "./transport/headers.js"
 
 type ApiAuth = { type: "api"; key?: string }
@@ -28,14 +28,18 @@ function stableHash(value: unknown): string {
   return crypto.createHash("sha256").update(JSON.stringify(value ?? "")).digest("hex").slice(0, 32)
 }
 
-const DEFAULT_BUNDLED_CONTEXT = 272000
+const DEFAULT_BUNDLED_LIMIT = {
+  context: CODEX_EFFECTIVE_CONTEXT_WINDOW,
+  input: CODEX_EFFECTIVE_CONTEXT_WINDOW,
+  output: CODEX_OUTPUT_TOKEN_LIMIT,
+}
 
-function bundledContextFor(modelID: unknown): number {
+function bundledLimitFor(modelID: unknown): { context: number; input?: number; output: number } {
   if (typeof modelID === "string") {
     const match = OPENAI_WS_MODELS[modelID]
-    if (match?.limit?.context) return match.limit.context
+    if (match?.limit?.context) return match.limit
   }
-  return DEFAULT_BUNDLED_CONTEXT
+  return DEFAULT_BUNDLED_LIMIT
 }
 
 async function resolveOAuthAuth(auth: OAuthAuth, client: any): Promise<{ accessToken: string; accountId?: string }> {
@@ -80,10 +84,12 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
 
     "chat.params": async (input, _output) => {
       if (input.model.providerID !== PROVIDER_ID) return
-      const model = input.model as { limit?: { context?: number; output?: number } }
-      const bundledContext = bundledContextFor(input.model.id ?? (input.model as any).modelID)
+      const model = input.model as { limit?: { context?: number; input?: number; output?: number } }
+      const bundledLimit = bundledLimitFor(input.model.id ?? (input.model as any).modelID)
       if (!model.limit) model.limit = {}
-      if (!model.limit.context || model.limit.context < bundledContext) model.limit.context = bundledContext
+      model.limit.context = bundledLimit.context
+      model.limit.input = bundledLimit.input ?? bundledLimit.context
+      model.limit.output = bundledLimit.output
     },
 
     event: async ({ event }) => {
@@ -110,6 +116,7 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
             provider.models = resolveModelsForApiKey(allowedIds, provider.models as any) as any
           }
           const identity = transportIdentity({ type: "api", apiKey })
+          invalidateStaleAuthConnections(identity.wsUrl, identity.wsHeaders)
           ensureWarmConnection(identity.wsUrl, identity.wsHeaders)
           return {
             apiKey,
@@ -153,6 +160,7 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
             provider.models = resolveModelsForOAuth(catalog, provider.models as any) as any
           }
           const initialIdentity = transportIdentity({ type: "oauth", accessToken: initialAuth.accessToken, accountId: initialAuth.accountId })
+          invalidateStaleAuthConnections(initialIdentity.wsUrl, initialIdentity.wsHeaders)
           ensureWarmConnection(initialIdentity.wsUrl, initialIdentity.wsHeaders)
           return {
             apiKey: initialAuth.accessToken,
@@ -162,6 +170,7 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
               if (currentAuth?.type !== "oauth") throw new Error("OpenAI WebSocket OAuth auth is missing")
               const { accessToken, accountId } = await resolveOAuthAuth(currentAuth, client)
               const identity = transportIdentity({ type: "oauth", accessToken, accountId })
+              invalidateStaleAuthConnections(identity.wsUrl, identity.wsHeaders)
               const url = typeof input === "string" ? new URL(input) : input instanceof URL ? input : new URL(input.url)
               const context = extractTransportContext(init?.headers)
               if (shouldBridge(url, init)) {

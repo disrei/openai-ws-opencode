@@ -32,6 +32,7 @@ import {
   apiKeyWebSocketHeaders,
   bridgeWebSocket,
   connectionPool,
+  invalidateStaleAuthConnections,
   oauthTesting,
   oauthWebSocketHeaders,
   prepareBody,
@@ -41,6 +42,7 @@ import {
   fallbackCodexClientVersion,
   fetchCodexCatalog,
   fetchOpenAIModelIds,
+  ensureWarmConnection,
   resolveCodexClientVersion,
   resolveModels,
   resolveModelsForApiKey,
@@ -417,6 +419,33 @@ async function readAll(response: Response): Promise<string> {
   return text
 }
 
+async function readNextSSEText(reader: ReadableStreamDefaultReader<Uint8Array>): Promise<string> {
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) throw new Error("Expected SSE chunk before stream end")
+    const text = new TextDecoder().decode(value)
+    if (text.startsWith(":")) continue
+    return text
+  }
+}
+
+async function expectNextReadRejects(reader: ReadableStreamDefaultReader<Uint8Array>, expected: RegExp | string): Promise<void> {
+  while (true) {
+    try {
+      const { value, done } = await reader.read()
+      if (done) throw new Error("Expected stream read to reject before stream end")
+      const text = value ? new TextDecoder().decode(value) : ""
+      if (text.startsWith(":")) continue
+      throw new Error(`Expected stream read to reject, got ${text}`)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (expected instanceof RegExp) expect(message).toMatch(expected)
+      else expect(message).toContain(expected)
+      return
+    }
+  }
+}
+
 async function waitForWire(condition: () => boolean, label: string, timeoutMs = 1_000): Promise<void> {
   const started = Date.now()
   while (Date.now() - started < timeoutMs) {
@@ -486,7 +515,8 @@ describe("setup", () => {
     )
 
     const models = JSON.parse(patched).provider["openai-ws"].models
-    expect(models["gpt-5.4-mini"].limit.context).toBeLessThan(1050000)
+    expect(models["gpt-5.4-mini"].limit.context).toBe(272000)
+    expect(models["gpt-5.4-mini"].limit.input).toBe(272000)
     expect(models["gpt-5.4-mini"].limit.output).toBe(128000)
     expect(models["gpt-5.4-mini"].variants).not.toHaveProperty("minimal")
     expect(models["gpt-5.4-mini"].variants).not.toHaveProperty("none")
@@ -728,7 +758,7 @@ describe("models", () => {
     expect(models.length).toBeGreaterThan(0)
     expect(models.every((model) => model.providerID === PROVIDER_ID)).toBe(true)
     expect(models.every((model) => model.api.url === "https://api.openai.com/v1")).toBe(true)
-    expect(models.every((model) => model.limit.context > 0 && model.limit.output > 0)).toBe(true)
+    expect(models.every((model) => model.limit.context === 272000 && model.limit.input === 272000 && model.limit.output > 0)).toBe(true)
     expect(models.every((model) => model.capabilities.reasoning && model.capabilities.toolcall)).toBe(true)
     expect(models.some((model) => model.family === "gpt-codex")).toBe(true)
     expect(models.some((model) => model.variants.xhigh)).toBe(true)
@@ -775,13 +805,13 @@ describe("models", () => {
       providerID: "openai-ws",
       name: "GPT-5.4 Codex (WebSocket)",
       family: "gpt-codex",
-      limit: { context: 160000, output: 128000 },
+      limit: { context: 272000, input: 272000, output: 128000 },
     })
     expect(resolved["gpt-5.4-codex"].variants.medium).toMatchObject({ reasoningEffort: "medium", reasoningSummary: "auto" })
     expect(resolved["non-ws-model"]).toBeUndefined()
   })
 
-  test("uses Codex catalog limits instead of bundled setup limits for OAuth models", () => {
+  test("uses bundled Codex window instead of catalog or setup limits for OAuth models", () => {
     const resolved = resolveModelsForOAuth(
       [
         {
@@ -803,10 +833,10 @@ describe("models", () => {
     )
 
     expect(resolved["gpt-5.5"].name).toBe("GPT-5.5 (WebSocket)")
-    expect(resolved["gpt-5.5"].limit).toEqual({ context: 272000, output: 128000 })
+    expect(resolved["gpt-5.5"].limit).toEqual({ context: 272000, input: 272000, output: 128000 })
   })
 
-  test("uses max context when context window is absent in Codex catalog metadata", () => {
+  test("uses bundled Codex window when catalog context metadata differs", () => {
     const resolved = resolveModelsForOAuth([
       {
         slug: "gpt-5.99",
@@ -818,7 +848,7 @@ describe("models", () => {
       },
     ])
 
-    expect(resolved["gpt-5.99"].limit).toEqual({ context: 270000, output: 128000 })
+    expect(resolved["gpt-5.99"].limit).toEqual({ context: 272000, input: 272000, output: 128000 })
   })
 
   test("falls back to bundled models when the Codex catalog is unavailable or empty", () => {
@@ -872,7 +902,7 @@ describe("models", () => {
 
   test("falls back to package version when Codex client_version metadata is unavailable", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(new Response("nope", { status: 500 }))
-    await expect(resolveCodexClientVersion({ fetchImpl })).resolves.toBe("0.1.20")
+    await expect(resolveCodexClientVersion({ fetchImpl })).resolves.toBe("0.1.22")
     expect(fallbackCodexClientVersion("codex-rs/0.131.0-alpha.4")).toBe("0.131.0-alpha.4")
   })
 
@@ -1091,10 +1121,14 @@ describe("plugin auth loader", () => {
     const low = { model: { providerID: "openai-ws", id: "gpt-5.4-mini", limit: { context: 200000, output: 128000 } } } as any
     await hooks["chat.params"]?.(low, { temperature: 0, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} } as any)
     expect(low.model.limit.context).toBe(272000)
+    expect(low.model.limit.input).toBe(272000)
+    expect(low.model.limit.output).toBe(128000)
 
     const missing = { model: { providerID: "openai-ws", id: "gpt-5.4-mini" } } as any
     await hooks["chat.params"]?.(missing, { temperature: 0, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} } as any)
     expect(missing.model.limit.context).toBe(272000)
+    expect(missing.model.limit.input).toBe(272000)
+    expect(missing.model.limit.output).toBe(128000)
 
     const other = { model: { providerID: "openai", id: "gpt-5.4-mini", limit: { context: 200000, output: 128000 } } } as any
     await hooks["chat.params"]?.(other, { temperature: 0, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} } as any)
@@ -1102,7 +1136,9 @@ describe("plugin auth loader", () => {
 
     const override = { model: { providerID: "openai-ws", id: "gpt-5.4-mini", limit: { context: 1_000_000, output: 128000 } } } as any
     await hooks["chat.params"]?.(override, { temperature: 0, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} } as any)
-    expect(override.model.limit.context).toBe(1_000_000)
+    expect(override.model.limit.context).toBe(272000)
+    expect(override.model.limit.input).toBe(272000)
+    expect(override.model.limit.output).toBe(128000)
   })
 
   test("plugin cleanup events close scoped and global pooled connections", async () => {
@@ -1179,9 +1215,30 @@ describe("websocket bridge", () => {
   test("transport defaults support retries and stream idle timeouts without client heartbeat", () => {
     expect(transportConfig.connectTimeoutMs).toBeGreaterThan(0)
     expect(transportConfig.maxReconnectAttempts).toBeGreaterThan(0)
+    expect(transportConfig.reconnectJitterRatio).toBeGreaterThan(0)
     expect(transportConfig.streamIdleTimeoutMs).toBe(600_000)
+    expect(transportConfig.preFirstBytePing).toBe(":\n\n")
     expect(transportConfig).not.toHaveProperty("heartbeatIntervalMs")
     expect(transportConfig).not.toHaveProperty("pongTimeoutMs")
+  })
+
+  test("emits an SSE comment ping before first websocket byte", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
+      false,
+    )
+    const reader = response.body!.getReader()
+    await Promise.resolve()
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe(":\n\n")
+
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    ws.serverMessage({ type: "response.completed", response: { id: "resp_ping" } })
+    expect(await readNextSSEText(reader)).toContain("resp_ping")
+    expect((await reader.read()).done).toBe(true)
   })
 
   test("sends response.create with ws headers", async () => {
@@ -1365,7 +1422,7 @@ describe("websocket bridge", () => {
 
     controller.abort(new DOMException("restart", "AbortError"))
 
-    await expect(reader.read()).rejects.toThrow(/restart|aborted/i)
+    await expectNextReadRejects(reader, /restart|aborted/i)
     expect(sentFrames(firstWs).map((value) => value.type)).toEqual(["response.create", "response.cancel"])
     expect(sentFrames(firstWs)[1]).toMatchObject({ response_id: "resp_created_before_cancel" })
 
@@ -1523,7 +1580,7 @@ describe("websocket bridge", () => {
       status: 429,
       error: { code: "usage_limit_reached", message: "usage limit reached" },
     })
-    await expect(reader.read()).rejects.toThrow(/OpenAI WebSocket error 429 usage_limit_reached: usage limit reached/)
+    await expectNextReadRejects(reader, /OpenAI WebSocket error 429 usage_limit_reached: usage limit reached/)
   })
 
   test("maps usage-limit websocket errors without upstream status to 429", async () => {
@@ -1541,7 +1598,7 @@ describe("websocket bridge", () => {
       type: "error",
       error: { code: "usage_limit_reached", message: "usage limit reached" },
     })
-    await expect(reader.read()).rejects.toThrow(/OpenAI WebSocket error 429 usage_limit_reached: usage limit reached/)
+    await expectNextReadRejects(reader, /OpenAI WebSocket error 429 usage_limit_reached: usage limit reached/)
   })
 
   test("falls back to supplied HTTP stream before websocket data is emitted", async () => {
@@ -1597,7 +1654,7 @@ describe("websocket bridge", () => {
 
     ws.emit("close", 1006, Buffer.from("abnormal"))
 
-    await expect(reader.read()).rejects.toThrow(/response\.create was already sent/)
+    await expectNextReadRejects(reader, /response\.create was already sent/)
     expect(fallbackFetch).not.toHaveBeenCalled()
   })
 
@@ -1617,7 +1674,7 @@ describe("websocket bridge", () => {
     const reader = response.body!.getReader()
     controller.abort(new Error("stop"))
 
-    await expect(reader.read()).rejects.toThrow(/stop/)
+    await expectNextReadRejects(reader, /stop/)
     expect(fallbackFetch).not.toHaveBeenCalled()
   })
 
@@ -1642,6 +1699,26 @@ describe("websocket bridge", () => {
 
     expect(new TextDecoder().decode((await reader.read()).value)).toContain("response.created")
     expect(new TextDecoder().decode((await reader.read()).value)).toContain("response.completed")
+    expect((await reader.read()).done).toBe(true)
+  })
+
+  test("forwards concatenated and carried websocket JSON frames", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
+      false,
+    )
+    const reader = response.body!.getReader()
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    ws.emit("message", '{"type":"response.output_text.delta","sequence_number":0,"delta":"brace } inside","response_id":"resp_1"')
+    await Promise.resolve()
+    ws.emit("message", '}{"type":"response.completed","sequence_number":1,"response":{"id":"resp_1"}}')
+
+    expect(await readNextSSEText(reader)).toContain("brace } inside")
+    expect(await readNextSSEText(reader)).toContain("response.completed")
     expect((await reader.read()).done).toBe(true)
   })
 
@@ -1804,7 +1881,7 @@ describe("websocket bridge", () => {
       status: 400,
       error: { code: "previous_response_not_found", message: "Previous response not found" },
     })
-    await expect(reader.read()).rejects.toThrow(/cannot safely retry without previous_response_id/)
+    await expectNextReadRejects(reader, /cannot safely retry without previous_response_id/)
     expect(firstWs.sent).toHaveLength(2)
 
     const next = bridgeWebSocket(
@@ -1833,7 +1910,7 @@ describe("websocket bridge", () => {
     const ws = MockWebSocket.instances[0]
     ws.open()
     ws.serverBinary()
-    await expect(reader.read()).rejects.toThrow(/unexpected binary websocket event/)
+    await expectNextReadRejects(reader, /unexpected binary websocket event/)
   })
 
   test("does not log secret-like values", () => {
@@ -1865,7 +1942,7 @@ describe("websocket bridge", () => {
     expect(first.sent).toHaveLength(1)
     first.close()
 
-    await expect(reader.read()).rejects.toThrow(/response\.create was already sent/s)
+    await expectNextReadRejects(reader, /response\.create was already sent/s)
     expect(MockWebSocket.instances).toHaveLength(1)
   })
 
@@ -1904,6 +1981,57 @@ describe("websocket bridge", () => {
     expect(MockWebSocket.instances).toHaveLength(2)
   })
 
+  test("jitters websocket reconnect backoff before response.create commits", async () => {
+    vi.useFakeTimers()
+    vi.spyOn(Math, "random").mockReturnValue(1)
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
+      false,
+    )
+
+    MockWebSocket.instances[0].emit("close", 1006, Buffer.from("connect failed"))
+    await Promise.resolve()
+    vi.advanceTimersByTime(49)
+    await Promise.resolve()
+    expect(MockWebSocket.instances).toHaveLength(1)
+    vi.advanceTimersByTime(1)
+    await Promise.resolve()
+    expect(MockWebSocket.instances).toHaveLength(2)
+
+    const retry = MockWebSocket.instances[1]
+    retry.open()
+    retry.serverMessage({ type: "response.completed", response: { id: "resp_jitter" } })
+    expect(await readAll(response)).toContain("resp_jitter")
+  })
+
+  test("honors Retry-After on websocket handshake retry", async () => {
+    vi.useFakeTimers()
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
+      false,
+    )
+
+    MockWebSocket.instances[0].emit("unexpected-response", {}, { statusCode: 503, headers: { "retry-after": "2" } })
+    await Promise.resolve()
+    vi.advanceTimersByTime(1_999)
+    await Promise.resolve()
+    expect(MockWebSocket.instances).toHaveLength(1)
+    vi.advanceTimersByTime(1)
+    await Promise.resolve()
+    expect(MockWebSocket.instances).toHaveLength(2)
+
+    const retry = MockWebSocket.instances[1]
+    retry.open()
+    retry.serverMessage({ type: "response.completed", response: { id: "resp_retry_after" } })
+    expect(await readAll(response)).toContain("resp_retry_after")
+  })
+
   test("includes websocket send callback errors in retry diagnostics", async () => {
     vi.useFakeTimers()
     setWebSocketConstructorForTesting(DeferredSendWebSocket as any)
@@ -1927,7 +2055,7 @@ describe("websocket bridge", () => {
       }
     }
 
-    await expect(reader.read()).rejects.toThrow(/retry limit reached before response\.create was sent.*write failed 5/s)
+    await expectNextReadRejects(reader, /retry limit reached before response\.create was sent.*write failed 5/s)
     expect(MockWebSocket.instances).toHaveLength(6)
   })
 
@@ -1968,7 +2096,7 @@ describe("websocket bridge", () => {
 
     ws.emit("close", 1006, Buffer.from("abnormal"))
 
-    await expect(reader.read()).rejects.toThrow(/response\.create was already sent.*1006.*abnormal/s)
+    await expectNextReadRejects(reader, /response\.create was already sent.*1006.*abnormal/s)
     expect(MockWebSocket.instances).toHaveLength(1)
   })
 
@@ -1988,7 +2116,7 @@ describe("websocket bridge", () => {
 
     ws.emit("close", 1008, Buffer.from("usage_limit_reached"))
 
-    await expect(reader.read()).rejects.toThrow(/OpenAI WebSocket error 429 usage_limit_reached/)
+    await expectNextReadRejects(reader, /OpenAI WebSocket error 429 usage_limit_reached/)
   })
 
   test("finishes cleanly when websocket closes after final message output item", async () => {
@@ -2040,7 +2168,7 @@ describe("websocket bridge", () => {
     expect(new TextDecoder().decode(created.value)).toContain("response.created")
 
     first.emit("close", 1006, Buffer.from("abnormal"))
-    await expect(reader.read()).rejects.toThrow(/response\.create was already sent/)
+    await expectNextReadRejects(reader, /response\.create was already sent/)
     expect(MockWebSocket.instances).toHaveLength(1)
   })
 
@@ -2065,7 +2193,7 @@ describe("websocket bridge", () => {
       }
     }
 
-    await expect(reader.read()).rejects.toThrow(/retry limit reached before response\.create was sent.*1011/s)
+    await expectNextReadRejects(reader, /retry limit reached before response\.create was sent.*1011/s)
     expect(MockWebSocket.instances).toHaveLength(6)
   })
 
@@ -2095,6 +2223,22 @@ describe("websocket bridge", () => {
     )
     expect(MockWebSocket.instances).toHaveLength(2)
     expect(firstWs.readyState).toBe(3)
+  })
+
+  test("invalidates stale auth-scoped warm sockets", () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    ensureWarmConnection("wss://example.test/responses", apiKeyWebSocketHeaders("old-key"))
+    const oldWs = MockWebSocket.instances[0]
+    oldWs.open()
+    expect(connectionPool).toHaveLength(1)
+
+    invalidateStaleAuthConnections("wss://example.test/responses", apiKeyWebSocketHeaders("new-key"))
+
+    expect(connectionPool).toHaveLength(0)
+    expect(oldWs.readyState).toBe(3)
+
+    ensureWarmConnection("wss://example.test/responses", apiKeyWebSocketHeaders("new-key"))
+    expect(MockWebSocket.instances).toHaveLength(2)
   })
 
   test("release does not schedule a client heartbeat", async () => {
@@ -2172,7 +2316,7 @@ describe("websocket bridge", () => {
     vi.advanceTimersByTime(600_000)
     await Promise.resolve()
 
-    await expect(reader.read()).rejects.toThrow(/idle timeout waiting for websocket after response\.output_item\.done/)
+    await expectNextReadRejects(reader, /idle timeout waiting for websocket after response\.output_item\.done/)
     expect(ws.terminateCount).toBeGreaterThan(0)
   })
 
@@ -2192,6 +2336,7 @@ describe("websocket bridge", () => {
 
     vi.advanceTimersByTime(599_999)
     await Promise.resolve()
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe(":\n\n")
     let pending = true
     const pendingRead = reader.read().then((result) => {
       pending = false
@@ -2329,7 +2474,7 @@ describe("websocket bridge", () => {
 
     controller.abort()
 
-    await expect(reader.read()).rejects.toThrow(/aborted/i)
+    await expectNextReadRejects(reader, /aborted/i)
     expect(sentFrames(ws).map((value) => value.type)).toEqual(["response.create", "response.cancel"])
     expect(ws.terminateCount).toBeGreaterThan(0)
   })
@@ -2421,14 +2566,14 @@ describe("websocket bridge", () => {
       )
       await waitForWire(() => received[0]?.bodies.length === 1, "first live response.create")
       const firstReader = first.body!.getReader()
-      expect(parseSSEData(new TextDecoder().decode((await firstReader.read()).value))).toMatchObject({
+      expect(parseSSEData(await readNextSSEText(firstReader))).toMatchObject({
         type: "response.created",
         response: { id: "resp_interrupted_seed" },
       })
 
       controller.abort(new DOMException("Injected replacement", "AbortError"))
 
-      await expect(firstReader.read()).rejects.toThrow(/Injected replacement|aborted/i)
+      await expectNextReadRejects(firstReader, /Injected replacement|aborted/i)
       await waitForWire(
         () => received[0]?.messages.some((message) => message.type === "response.cancel") === true,
         "live response.cancel",
@@ -2493,7 +2638,7 @@ describe("websocket bridge", () => {
         controller.signal,
       )
       const firstReader = first.body!.getReader()
-      const createdText = new TextDecoder().decode((await firstReader.read()).value)
+      const createdText = await readNextSSEText(firstReader)
       const createdFrame = parseSSEData(createdText)
       const capturedID = (createdFrame.response as { id?: string } | undefined)?.id
       expect(createdFrame).toMatchObject({ type: "response.created", response: { id: "resp_cancel_seed" } })
@@ -2501,7 +2646,7 @@ describe("websocket bridge", () => {
 
       controller.abort(new DOMException("Captured response id", "AbortError"))
 
-      await expect(firstReader.read()).rejects.toThrow(/Captured response id|aborted/i)
+      await expectNextReadRejects(firstReader, /Captured response id|aborted/i)
       await waitForWire(
         () => received[0]?.messages.some((message) => message.type === "response.cancel") === true,
         "response.cancel after captured id",

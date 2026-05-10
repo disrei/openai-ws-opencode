@@ -912,6 +912,42 @@ describe("plugin auth loader", () => {
     expect(headers.get(INTERNAL_PREFIX_HASH_HEADER)).toBeNull()
   })
 
+  test("falls back to HTTP SSE when websocket transport fails before streaming", async () => {
+    vi.useFakeTimers()
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any) => {
+      const url = String(input)
+      if (url.includes("/v1/models")) return new Response(JSON.stringify({ data: [{ id: "gpt-5.5" }] }), { status: 200 })
+      return new Response('event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_http"}}\n\n', {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      })
+    })
+    const hooks = await plugin({ client: { auth: { set: vi.fn() } } } as any)
+    const loaded = await hooks.auth?.loader?.(async () => ({ type: "api", key: "api-key-test" }) as any, { models: {} } as any)
+
+    const response = await loaded?.fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      body: JSON.stringify({ model: "gpt-5.5", input: "hi", stream: true }),
+    })
+
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const ws = MockWebSocket.instances[attempt]
+      expect(ws).toBeDefined()
+      ws.emit("close", 1006, Buffer.from("connect failed"))
+      await Promise.resolve()
+      if (attempt < 5) {
+        vi.advanceTimersByTime(2_000)
+        await Promise.resolve()
+      }
+    }
+
+    expect(await readAll(response!)).toContain("resp_http")
+    const fallbackCall = fetchSpy.mock.calls.at(-1) as [RequestInfo | URL, RequestInit]
+    expect(JSON.parse(String(fallbackCall[1].body))).toMatchObject({ stream: true, store: false })
+    expect(new Headers(fallbackCall[1].headers).get("Authorization")).toBe("Bearer api-key-test")
+  })
+
   test("rewrites OAuth HTTP fallback requests to the Codex responses endpoint", async () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input: any) => {
@@ -1053,7 +1089,7 @@ describe("websocket bridge", () => {
     })
   })
 
-  test("keeps turn-state sockets reusable and sends continuation on the next turn", async () => {
+  test("keeps turn-state sockets reusable without implicit continuation on the next turn", async () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const first = bridgeWebSocket(
       "wss://example.test/responses",
@@ -1089,18 +1125,103 @@ describe("websocket bridge", () => {
       { sessionID: "sess_1", agent: "review", stablePrefixHash: "prefix_1" },
     )
     expect(MockWebSocket.instances).toHaveLength(1)
-    expect(JSON.parse(firstWs.sent[1])).toMatchObject({
+    const secondFrame = JSON.parse(firstWs.sent[1])
+    expect(secondFrame).toMatchObject({
       type: "response.create",
-      previous_response_id: "resp_1",
       prompt_cache_key: "prefix_1",
       client_metadata: {
         "x-codex-window-id": "sess_1",
         "x-openai-subagent": "review",
       },
     })
+    expect(secondFrame).not.toHaveProperty("previous_response_id")
     firstWs.serverMessage({ type: "response.completed", response: { id: "resp_2" } })
     const secondReader = second.body!.getReader()
     while (!(await secondReader.read()).done) {}
+  })
+
+  test("preserves explicit previous_response_id when supplied by the caller", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "again", stream: true, previous_response_id: "resp_explicit" },
+      false,
+      { sessionID: "sess_1" },
+    )
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    expect(sentFrames(ws)[0]).toMatchObject({
+      type: "response.create",
+      previous_response_id: "resp_explicit",
+    })
+    ws.serverMessage({ type: "response.completed", response: { id: "resp_done" } })
+    await readAll(response)
+  })
+
+  test("sends hook-mutated full context without hidden continuation state", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const first = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "first", stream: true },
+      false,
+      { sessionID: "sess_hooks" },
+    )
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    ws.serverMessage({ type: "response.completed", response: { id: "resp_first" } })
+    await readAll(first)
+
+    const injectedContext = "<hook-context>fresh runtime context</hook-context>"
+    const fullContextInput = [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "original prompt" }] },
+      { type: "message", role: "user", content: [{ type: "input_text", text: injectedContext }] },
+    ]
+    const second = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: fullContextInput, stream: true },
+      false,
+      { sessionID: "sess_hooks" },
+    )
+    const frame = JSON.parse(ws.sent[1])
+    expect(frame).toMatchObject({
+      type: "response.create",
+      input: fullContextInput,
+    })
+    expect(frame).not.toHaveProperty("previous_response_id")
+    ws.serverMessage({ type: "response.completed", response: { id: "resp_second" } })
+    await readAll(second)
+  })
+
+  test("snapshots response body at bridge entry", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const body: Record<string, unknown> = { model: "gpt-5.5", input: "before", stream: true }
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      body,
+      false,
+      { sessionID: "sess_snapshot", stablePrefixHash: "prefix_before" },
+    )
+
+    body.model = "mutated"
+    body.input = "after"
+    body.previous_response_id = "resp_mutated"
+
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    const frame = sentFrames(ws)[0]
+    expect(frame).toMatchObject({
+      type: "response.create",
+      model: "gpt-5.5",
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "before" }] }],
+      prompt_cache_key: "prefix_before",
+    })
+    expect(frame).not.toHaveProperty("previous_response_id")
+    ws.serverMessage({ type: "response.completed", response: { id: "resp_snapshot" } })
+    await readAll(response)
   })
 
   test("can acknowledge completed responses with response.processed", async () => {
@@ -1178,6 +1299,101 @@ describe("websocket bridge", () => {
     await expect(reader.read()).rejects.toThrow(/OpenAI WebSocket error 429 usage_limit_reached: usage limit reached/)
   })
 
+  test("maps usage-limit websocket errors without upstream status to 429", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "hi", stream: true },
+      false,
+    )
+    const reader = response.body!.getReader()
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    ws.serverMessage({
+      type: "error",
+      error: { code: "usage_limit_reached", message: "usage limit reached" },
+    })
+    await expect(reader.read()).rejects.toThrow(/OpenAI WebSocket error 429 usage_limit_reached: usage limit reached/)
+  })
+
+  test("falls back to supplied HTTP stream before websocket data is emitted", async () => {
+    vi.useFakeTimers()
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const fallbackFetch = vi.fn(async () => {
+      return new Response('event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_fallback"}}\n\n', {
+        headers: { "content-type": "text/event-stream" },
+      })
+    })
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "hi", stream: true },
+      false,
+      {},
+      undefined,
+      fallbackFetch,
+    )
+
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const ws = MockWebSocket.instances[attempt]
+      expect(ws).toBeDefined()
+      ws.emit("close", 1006, Buffer.from("connect failed"))
+      await Promise.resolve()
+      if (attempt < 5) {
+        vi.advanceTimersByTime(2_000)
+        await Promise.resolve()
+      }
+    }
+
+    expect(await readAll(response)).toContain("resp_fallback")
+    expect(fallbackFetch).toHaveBeenCalledTimes(1)
+  })
+
+  test("does not fall back after websocket data has been emitted", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const fallbackFetch = vi.fn(async () => new Response("event: response.completed\ndata: {}\n\n"))
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "hi", stream: true },
+      false,
+      {},
+      undefined,
+      fallbackFetch,
+    )
+    const reader = response.body!.getReader()
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    ws.serverMessage({ type: "response.created", sequence_number: 0, response: { id: "resp_1" } })
+    expect(new TextDecoder().decode((await reader.read()).value)).toContain("response.created")
+
+    ws.emit("close", 1006, Buffer.from("abnormal"))
+
+    await expect(reader.read()).rejects.toThrow(/response\.create was already sent/)
+    expect(fallbackFetch).not.toHaveBeenCalled()
+  })
+
+  test("does not fall back after client abort", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const controller = new AbortController()
+    const fallbackFetch = vi.fn(async () => new Response("event: response.completed\ndata: {}\n\n"))
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "hi", stream: true },
+      false,
+      {},
+      controller.signal,
+      fallbackFetch,
+    )
+    const reader = response.body!.getReader()
+    controller.abort(new Error("stop"))
+
+    await expect(reader.read()).rejects.toThrow(/stop/)
+    expect(fallbackFetch).not.toHaveBeenCalled()
+  })
+
   test("forwards newline-delimited websocket frames from one message", async () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const response = bridgeWebSocket(
@@ -1219,7 +1435,7 @@ describe("websocket bridge", () => {
     }
   })
 
-  test("clears continuation after failed response events", async () => {
+  test("does not add implicit continuation after failed response events", async () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const first = bridgeWebSocket(
       "wss://example.test/responses",
@@ -1256,7 +1472,7 @@ describe("websocket bridge", () => {
     await readAll(next)
   })
 
-  test("retries previous_response_not_found without previous_response_id for replay-safe input", async () => {
+  test("retries explicit previous_response_not_found without previous_response_id for replay-safe input", async () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const first = bridgeWebSocket(
       "wss://example.test/responses",
@@ -1273,7 +1489,7 @@ describe("websocket bridge", () => {
     const second = bridgeWebSocket(
       "wss://example.test/responses",
       apiKeyWebSocketHeaders("api-key-test"),
-      { model: "gpt-5.5", input: "full context", stream: true },
+      { model: "gpt-5.5", input: "full context", stream: true, previous_response_id: "resp_missing" },
       false,
       { sessionID: "sess_1" },
     )
@@ -1290,6 +1506,29 @@ describe("websocket bridge", () => {
     ws.serverMessage({ type: "response.completed", response: { id: "resp_recovered" } })
     const text = await readAll(second)
     expect(text).toContain("response.completed")
+  })
+
+  test("does not retry previous_response_not_found when the request did not ask for continuation", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "full context", stream: true },
+      false,
+      { sessionID: "sess_no_previous" },
+    )
+    const reader = response.body!.getReader()
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    expect(JSON.parse(ws.sent[0])).not.toHaveProperty("previous_response_id")
+    ws.serverMessage({
+      type: "error",
+      status: 400,
+      error: { code: "previous_response_not_found", message: "Previous response not found" },
+    })
+
+    await expect(reader.read()).rejects.toThrow(/without explicit previous_response_id/)
+    expect(ws.sent).toHaveLength(1)
   })
 
   test("does not retry previous_response_not_found for tool-output-dependent input", async () => {
@@ -1316,6 +1555,7 @@ describe("websocket bridge", () => {
           { type: "message", role: "user", content: "continue" },
         ],
         stream: true,
+        previous_response_id: "resp_missing",
       },
       false,
       { sessionID: "sess_1" },
@@ -1493,6 +1733,25 @@ describe("websocket bridge", () => {
 
     await expect(reader.read()).rejects.toThrow(/response\.create was already sent.*1006.*abnormal/s)
     expect(MockWebSocket.instances).toHaveLength(1)
+  })
+
+  test("surfaces websocket policy closes with a clearer status hint", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const response = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.5", input: "hi", stream: true },
+      false,
+    )
+    const reader = response.body!.getReader()
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    ws.serverMessage({ type: "response.created", sequence_number: 0, response: { id: "resp_1" } })
+    expect(new TextDecoder().decode((await reader.read()).value)).toContain("response.created")
+
+    ws.emit("close", 1008, Buffer.from("usage_limit_reached"))
+
+    await expect(reader.read()).rejects.toThrow(/OpenAI WebSocket error 429 usage_limit_reached/)
   })
 
   test("finishes cleanly when websocket closes after final message output item", async () => {
@@ -1898,7 +2157,8 @@ describe("websocket bridge", () => {
           "x-openai-subagent": "review",
         },
       })
-      expect(createBodies[1]).toMatchObject({ type: "response.create", previous_response_id: "resp_live_hi" })
+      expect(createBodies[1]).toMatchObject({ type: "response.create" })
+      expect(createBodies[1]).not.toHaveProperty("previous_response_id")
       expect(firstText).toContain("response.completed")
       expect(secondText).toContain("response.completed")
     } finally {

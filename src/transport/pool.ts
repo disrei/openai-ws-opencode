@@ -26,15 +26,28 @@ export interface PendingRequest {
   body: Record<string, unknown>
   controller: ReadableStreamDefaultController<Uint8Array>
   onFinalize?: () => void
+  onError?: (error: Error, pending: PendingRequest) => boolean
   done: boolean
   sent: boolean
   writeCommitted: boolean
   framesReceived: boolean
   finalMessageOutputReceived: boolean
   processedAckSent: boolean
+  explicitPreviousResponseID: boolean
   previousResponseNotFoundRetried: boolean
   idleTimer: ReturnType<typeof setTimeout> | null
   metadata: PendingMetadata
+}
+
+export class WebSocketPreStreamTransportError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "WebSocketPreStreamTransportError"
+  }
+}
+
+export function isWebSocketPreStreamTransportError(error: unknown): error is WebSocketPreStreamTransportError {
+  return error instanceof WebSocketPreStreamTransportError || (error instanceof Error && error.name === "WebSocketPreStreamTransportError")
 }
 
 export interface PooledConnection {
@@ -259,16 +272,26 @@ function release(conn: PooledConnection) {
   }
 }
 
+function closeFailureSummary(conn: PooledConnection): string | undefined {
+  const reason = conn.lastCloseReason ?? ""
+  if (conn.lastCloseCode === 1008) {
+    if (reason.includes("usage_limit_reached")) return `OpenAI WebSocket error 429 usage_limit_reached${reason ? `: ${reason}` : ""}`
+    return `OpenAI WebSocket policy close 1008${reason ? `: ${reason}` : ""}`
+  }
+  return undefined
+}
+
 function formatFailureMessage(conn: PooledConnection, reason: string): string {
   const code = conn.lastCloseCode !== undefined ? conn.lastCloseCode : "unknown"
   const closeReason = JSON.stringify(conn.lastCloseReason ?? "")
   const lastError = conn.lastErrorMessage ? JSON.stringify(conn.lastErrorMessage) : "none"
+  const closeSummary = closeFailureSummary(conn)
   const pending = conn.pending
   const responseCreateState = pending
     ? `; responseCreateSent=${pending.sent}; responseCreateWriteCommitted=${pending.writeCommitted}; responseFramesReceived=${pending.framesReceived}`
     : ""
   return (
-    `WebSocket closed before response completed; cannot retry because ${reason}; ` +
+    `${closeSummary ? `${closeSummary}; ` : ""}WebSocket closed before response completed; cannot retry because ${reason}; ` +
     `reconnectAttempts=${conn.reconnectAttempts}/${transportConfig.maxReconnectAttempts}; ` +
     `closeCode=${code}; closeReason=${closeReason}; lastError=${lastError}${responseCreateState}`
   )
@@ -277,11 +300,18 @@ function formatFailureMessage(conn: PooledConnection, reason: string): string {
 function fail(conn: PooledConnection, error: Error, shouldCloseSocket: boolean) {
   const pending = conn.pending
   if (pending && !pending.done) {
+    const handled = pending.onError?.(error, pending) ?? false
     pending.done = true
-    finalizePending(pending)
-    try {
-      pending.controller.error(error)
-    } catch {}
+    if (handled) {
+      clearPendingTimer(pending)
+      pending.onFinalize = undefined
+      pending.onError = undefined
+    } else {
+      finalizePending(pending)
+      try {
+        pending.controller.error(error)
+      } catch {}
+    }
   }
   conn.pending = null
   conn.busy = false
@@ -379,7 +409,12 @@ function wrappedWebSocketError(frame: Record<string, unknown>): Error | undefine
   if (code === "websocket_connection_limit_reached") {
     return new Error(message ?? "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue.")
   }
-  const status = numberFrom(frame.status) ?? numberFrom(frame.status_code) ?? numberFrom(error.status) ?? numberFrom(error.status_code)
+  const status =
+    numberFrom(frame.status) ??
+    numberFrom(frame.status_code) ??
+    numberFrom(error.status) ??
+    numberFrom(error.status_code) ??
+    (code === "usage_limit_reached" ? 429 : undefined)
   if (status !== undefined && status >= 200 && status < 300) return undefined
   return new Error(
     `OpenAI WebSocket error${status !== undefined ? ` ${status}` : ""}${code ? ` ${code}` : ""}${message ? `: ${message}` : ""}`,
@@ -432,6 +467,10 @@ function clearLastResponseID(conn: PooledConnection) {
 function handlePreviousResponseNotFound(conn: PooledConnection, pending: PendingRequest): boolean {
   clearLastResponseID(conn)
   pending.metadata.responseId = undefined
+  if (!pending.explicitPreviousResponseID) {
+    fail(conn, new Error("OpenAI WebSocket previous_response_not_found for a request without explicit previous_response_id"), true)
+    return true
+  }
   if (pending.previousResponseNotFoundRetried) {
     fail(conn, new Error("OpenAI WebSocket previous_response_not_found after retrying without previous_response_id"), true)
     return true
@@ -522,7 +561,6 @@ export function sendPending(conn: PooledConnection): boolean {
   const generation = conn.generation
   try {
     const body = { ...pending.body }
-    if (body.previous_response_id === undefined && conn.lastResponseID) body.previous_response_id = conn.lastResponseID
     const payload = JSON.stringify({ ...body, type: "response.create" })
     pending.sent = true
     ws.send(payload, (error?: Error) => {
@@ -630,21 +668,37 @@ function connect(conn: PooledConnection) {
     handleSocketLoss(conn)
   }
 
+  const handleUnexpectedResponse = (_request: unknown, response: unknown) => {
+    if (generation !== conn.generation) return
+    const status = numberFrom((response as { statusCode?: unknown } | undefined)?.statusCode)
+    if (status !== undefined) conn.lastCloseCode = status
+    conn.lastCloseReason = `websocket handshake failed${status !== undefined ? ` with status ${status}` : ""}`
+    handleSocketLoss(conn)
+  }
+
   const attachUpgrade = supportsUpgradeEvent(WebSocketImpl)
-  const ws = new WebSocketImpl(conn.wsUrl, {
-    headers: conn.headers,
-    perMessageDeflate: true,
-    finishRequest(request) {
-      if (attachUpgrade) request.on?.("upgrade", handleUpgrade)
-      request.end?.()
-    },
-  })
+  let ws: WebSocketLike
+  try {
+    ws = new WebSocketImpl(conn.wsUrl, {
+      headers: conn.headers,
+      perMessageDeflate: true,
+      finishRequest(request) {
+        if (attachUpgrade) request.on?.("upgrade", handleUpgrade)
+        request.end?.()
+      },
+    })
+  } catch (error) {
+    conn.lastErrorMessage = messageFromError(error) ?? "websocket constructor failed"
+    queueMicrotask(() => handleSocketLoss(conn))
+    return
+  }
   conn.ws = ws
   on(ws, "open", handleOpen)
   if (attachUpgrade) on(ws, "upgrade", handleUpgrade)
   on(ws, "message", handleMessage)
   on(ws, "error", handleError)
   on(ws, "close", handleClose)
+  if (attachUpgrade) on(ws, "unexpected-response", handleUnexpectedResponse)
 
   conn.detach = () => {
     off(ws, "open", handleOpen)
@@ -652,6 +706,7 @@ function connect(conn: PooledConnection) {
     off(ws, "message", handleMessage)
     off(ws, "error", handleError)
     off(ws, "close", handleClose)
+    if (attachUpgrade) off(ws, "unexpected-response", handleUnexpectedResponse)
   }
   if (ws.readyState === readyState.OPEN) queueMicrotask(handleOpen)
 }
@@ -699,7 +754,7 @@ function handleSocketLoss(conn: PooledConnection) {
     )
     return
   }
-  fail(conn, new Error(formatFailureMessage(conn, "retry limit reached before response.create was sent")), true)
+  fail(conn, new WebSocketPreStreamTransportError(formatFailureMessage(conn, "retry limit reached before response.create was sent")), true)
 }
 
 function create(wsUrl: string, headers: Record<string, string>, context: TransportContext = {}, warm = false): PooledConnection {

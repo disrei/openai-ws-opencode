@@ -102,7 +102,14 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
                 try {
                   const body = JSON.parse(init?.body as string) as Record<string, unknown>
                   if (body.stream !== false) {
-                    return bridgeWebSocket(identity.wsUrl, identity.wsHeaders, body, false, context, init?.signal ?? undefined)
+                    return bridgeWebSocket(identity.wsUrl, identity.wsHeaders, body, false, context, init?.signal ?? undefined, (fallbackSignal) =>
+                      globalThis.fetch(input, {
+                        ...init,
+                        signal: fallbackSignal,
+                        body: JSON.stringify(prepareHttpFallbackBody(body, false)),
+                        headers: httpAuthHeaders(context.forwardHeaders, { type: "api", apiKey }),
+                      }),
+                    )
                   }
                 } catch {}
               }
@@ -142,7 +149,15 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
                 try {
                   const body = JSON.parse(init?.body as string) as Record<string, unknown>
                   if (body.stream !== false) {
-                    return bridgeWebSocket(identity.wsUrl, identity.wsHeaders, body, true, context, init?.signal ?? undefined)
+                    const rewrittenUrl = url.pathname.includes("/v1/responses") ? new URL(CODEX_API_ENDPOINT) : url
+                    return bridgeWebSocket(identity.wsUrl, identity.wsHeaders, body, true, context, init?.signal ?? undefined, (fallbackSignal) =>
+                      globalThis.fetch(rewrittenUrl, {
+                        ...init,
+                        signal: fallbackSignal,
+                        body: JSON.stringify(prepareHttpFallbackBody(body, true)),
+                        headers: httpAuthHeaders(context.forwardHeaders, { type: "oauth", accessToken, accountId }),
+                      }),
+                    )
                   }
                 } catch {}
               }

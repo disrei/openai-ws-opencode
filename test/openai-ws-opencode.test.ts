@@ -5,7 +5,7 @@ import os from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import { describe, expect, test, afterEach, vi } from "vitest"
-import WebSocket from "ws"
+import WebSocket, { WebSocketServer } from "ws"
 import plugin from "../src/index.js"
 import { createBrowserAuthorization } from "../src/auth/oauth.js"
 import { loadDefaultWebSocketConstructor } from "../src/transport/bun-websocket.js"
@@ -124,11 +124,22 @@ type WireServerSocket = {
   close?: () => void
 }
 
-type WireTurn = { headers: Record<string, string>; body?: Record<string, unknown>; bodies: Record<string, unknown>[] }
+type WireTurn = {
+  headers: Record<string, string>
+  body?: Record<string, unknown>
+  bodies: Record<string, unknown>[]
+  messages: Record<string, unknown>[]
+}
 
-function listenWireWebSocket(received: WireTurn[]) {
+type WireWebSocketOptions = {
+  autoComplete?: boolean | ((body: Record<string, unknown>, turn: WireTurn) => boolean)
+}
+
+type WireWebSocketServer = { port: number; stop(force?: boolean): void }
+
+async function listenWireWebSocket(received: WireTurn[], options: WireWebSocketOptions = {}): Promise<WireWebSocketServer> {
   const listen = (globalThis as { Bun?: { listen?: (options: unknown) => { port: number; stop(force?: boolean): void } } }).Bun?.listen
-  if (typeof listen !== "function") throw new Error("Bun.listen is unavailable")
+  if (typeof listen !== "function") return listenNodeWireWebSocket(received, options)
   const states = new WeakMap<object, { handshake: Buffer; frames: Buffer; turn?: WireTurn }>()
   const getState = (socket: object) => {
     const existing = states.get(socket)
@@ -152,16 +163,77 @@ function listenWireWebSocket(received: WireTurn[]) {
           const requestText = state.handshake.subarray(0, split).toString("utf8")
           rest = Buffer.from(state.handshake.subarray(split + 4))
           const headers = parseWireHeaders(requestText)
-          const turn: WireTurn = { headers, bodies: [] }
+          const turn: WireTurn = { headers, bodies: [], messages: [] }
           received.push(turn)
           state.turn = turn
           socket.write(wireUpgradeResponse(headers["sec-websocket-key"]))
         }
-        if (rest.length) receiveWireFrames(socket, state, rest)
+        if (rest.length) receiveWireFrames(socket, state, rest, options)
       },
     },
   })
   return server
+}
+
+function listenNodeWireWebSocket(received: WireTurn[], options: WireWebSocketOptions): Promise<WireWebSocketServer> {
+  return new Promise((resolve, reject) => {
+    const server = new WebSocketServer({ host: "127.0.0.1", port: 0 })
+    const sockets = new Set<WebSocket>()
+
+    const onError = (error: Error) => {
+      reject(error)
+    }
+
+    server.once("error", onError)
+    server.on("headers", (headers) => {
+      headers.push("x-codex-turn-state: turn_live")
+    })
+    server.on("connection", (socket, request) => {
+      sockets.add(socket)
+      socket.on("close", () => sockets.delete(socket))
+      const headers = Object.fromEntries(
+        Object.entries(request.headers).flatMap(([key, value]) =>
+          value === undefined ? [] : [[key, Array.isArray(value) ? value.join(", ") : String(value)]],
+        ),
+      )
+      const turn: WireTurn = { headers, bodies: [], messages: [] }
+      received.push(turn)
+      socket.on("message", (data, isBinary) => {
+        if (isBinary) return
+        const body = JSON.parse(data.toString("utf8")) as Record<string, unknown>
+        turn.body = body
+        turn.messages.push(body)
+        if (body.type !== "response.create") return
+        turn.bodies.push(body)
+        if (shouldAutoCompleteWireFrame(options, body, turn)) {
+          socket.send(JSON.stringify({ type: "response.completed", response: { id: `resp_live_${wireInputText(body)}` } }))
+        }
+      })
+    })
+    server.on("listening", () => {
+      server.off("error", onError)
+      const address = server.address()
+      if (!address || typeof address !== "object") {
+        reject(new Error("WebSocket test server did not expose a port"))
+        return
+      }
+      resolve({
+        port: address.port,
+        stop(force?: boolean) {
+          for (const socket of sockets) {
+            if (force) socket.terminate()
+            else socket.close()
+          }
+          server.close()
+        },
+      })
+    })
+  })
+}
+
+function shouldAutoCompleteWireFrame(options: WireWebSocketOptions, body: Record<string, unknown>, turn: WireTurn): boolean {
+  if (typeof options.autoComplete === "function") return options.autoComplete(body, turn)
+  return options.autoComplete ?? true
 }
 
 function parseWireHeaders(text: string): Record<string, string> {
@@ -194,6 +266,7 @@ function receiveWireFrames(
   socket: WireServerSocket,
   state: { frames: Buffer; turn?: WireTurn },
   data: Buffer,
+  options: WireWebSocketOptions = {},
 ) {
   state.frames = Buffer.concat([state.frames, data])
   while (state.frames.length >= 2) {
@@ -225,8 +298,12 @@ function receiveWireFrames(
     if (opcode !== 0x1 || !state.turn) continue
     const body = JSON.parse(payload.toString("utf8")) as Record<string, unknown>
     state.turn.body = body
-    if (body.type === "response.create") state.turn.bodies.push(body)
-    socket.write(encodeWireTextFrame(JSON.stringify({ type: "response.completed", response: { id: `resp_live_${wireInputText(body)}` } })))
+    state.turn.messages.push(body)
+    if (body.type !== "response.create") continue
+    state.turn.bodies.push(body)
+    if (shouldAutoCompleteWireFrame(options, body, state.turn)) {
+      socket.write(encodeWireTextFrame(JSON.stringify({ type: "response.completed", response: { id: `resp_live_${wireInputText(body)}` } })))
+    }
   }
 }
 
@@ -324,6 +401,15 @@ async function readAll(response: Response): Promise<string> {
     text += new TextDecoder().decode(value)
   }
   return text
+}
+
+async function waitForWire(condition: () => boolean, label: string, timeoutMs = 1_000): Promise<void> {
+  const started = Date.now()
+  while (Date.now() - started < timeoutMs) {
+    if (condition()) return
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  throw new Error(`Timed out waiting for ${label}`)
 }
 
 function jwtWithClaims(claims: Record<string, unknown>): string {
@@ -2098,9 +2184,8 @@ describe("websocket bridge", () => {
   })
 
   test("live websocket integration sends upstream-shaped headers and body across the wire", async () => {
-    if (typeof (globalThis as { Bun?: { listen?: unknown } }).Bun?.listen !== "function") return
     const received: WireTurn[] = []
-    const server = listenWireWebSocket(received)
+    const server = await listenWireWebSocket(received)
 
     try {
       const readAll = async (response: Response) => {
@@ -2160,6 +2245,71 @@ describe("websocket bridge", () => {
       expect(createBodies[1]).toMatchObject({ type: "response.create" })
       expect(createBodies[1]).not.toHaveProperty("previous_response_id")
       expect(firstText).toContain("response.completed")
+      expect(secondText).toContain("response.completed")
+    } finally {
+      resetPoolForTesting()
+      server.stop(true)
+    }
+  })
+
+  test("live websocket interruption followed by injected mutation sends fresh context across the wire", async () => {
+    const received: WireTurn[] = []
+    const server = await listenWireWebSocket(received, {
+      autoComplete: (body) => wireInputText(body) !== "before interruption",
+    })
+
+    try {
+      const controller = new AbortController()
+      const first = bridgeWebSocket(
+        `ws://127.0.0.1:${server.port}/responses`,
+        apiKeyWebSocketHeaders("api-key-test"),
+        { model: "gpt-5.5", input: "before interruption", stream: true },
+        false,
+        { sessionID: "sess_live_mutation", agent: "review", stablePrefixHash: "prefix_before" },
+        controller.signal,
+      )
+      await waitForWire(() => received[0]?.bodies.length === 1, "first live response.create")
+      const firstReader = first.body!.getReader()
+
+      controller.abort(new DOMException("Injected replacement", "AbortError"))
+
+      await expect(firstReader.read()).rejects.toThrow(/Injected replacement|aborted/i)
+      await waitForWire(
+        () => received[0]?.messages.some((message) => message.type === "response.cancel") === true,
+        "live response.cancel",
+      )
+
+      const injectedContext = "<hook-context>fresh runtime mutation</hook-context>"
+      const replacementInput = [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "replacement prompt" }] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: injectedContext }] },
+      ]
+      const second = bridgeWebSocket(
+        `ws://127.0.0.1:${server.port}/responses`,
+        apiKeyWebSocketHeaders("api-key-test"),
+        { model: "gpt-5.5", input: replacementInput, stream: true },
+        false,
+        { sessionID: "sess_live_mutation", agent: "review", stablePrefixHash: "prefix_after" },
+      )
+      const secondText = await readAll(second)
+      const createBodies = received.flatMap((turn) => turn.bodies)
+
+      expect(createBodies).toHaveLength(2)
+      expect(createBodies[0]).toMatchObject({
+        type: "response.create",
+        input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "before interruption" }] }],
+        prompt_cache_key: "prefix_before",
+      })
+      expect(createBodies[1]).toMatchObject({
+        type: "response.create",
+        input: replacementInput,
+        prompt_cache_key: "prefix_after",
+        client_metadata: {
+          "x-codex-window-id": "sess_live_mutation",
+          "x-openai-subagent": "review",
+        },
+      })
+      expect(createBodies[1]).not.toHaveProperty("previous_response_id")
       expect(secondText).toContain("response.completed")
     } finally {
       resetPoolForTesting()

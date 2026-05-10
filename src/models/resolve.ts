@@ -90,7 +90,7 @@ function fallbackModelFor(id: string): OpenAIWSModelDef {
     name: `${id} (WebSocket)`,
     reasoning: true,
     temperature: false,
-    limit: { context: 258400, output: 128000 },
+    limit: { context: 272000, output: 128000 },
     variants: {},
     ...(id.includes("codex") ? { family: "gpt-codex" } : id.endsWith("-pro") ? { family: "gpt-pro" } : {}),
   }
@@ -101,8 +101,8 @@ function fallbackModelFor(id: string): OpenAIWSModelDef {
 function resolvedCodexContextWindow(model: CodexModelInfo): number | undefined {
   const context = model.context_window ?? model.max_context_window
   if (!context) return undefined
-  const percent = model.effective_context_window_percent ?? 95
-  return Math.floor((context * percent) / 100)
+  if (model.effective_context_window_percent != null) return Math.floor((context * model.effective_context_window_percent) / 100)
+  return context
 }
 
 function modelFromCodexCatalog(model: CodexModelInfo): [string, OpenAIWSModelDef] | undefined {

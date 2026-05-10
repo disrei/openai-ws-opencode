@@ -803,7 +803,7 @@ describe("models", () => {
     )
 
     expect(resolved["gpt-5.5"].name).toBe("GPT-5.5 (WebSocket)")
-    expect(resolved["gpt-5.5"].limit).toEqual({ context: 258400, output: 128000 })
+    expect(resolved["gpt-5.5"].limit).toEqual({ context: 272000, output: 128000 })
   })
 
   test("uses max context when context window is absent in Codex catalog metadata", () => {
@@ -872,7 +872,7 @@ describe("models", () => {
 
   test("falls back to package version when Codex client_version metadata is unavailable", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(new Response("nope", { status: 500 }))
-    await expect(resolveCodexClientVersion({ fetchImpl })).resolves.toBe("0.1.13")
+    await expect(resolveCodexClientVersion({ fetchImpl })).resolves.toBe("0.1.20")
     expect(fallbackCodexClientVersion("codex-rs/0.131.0-alpha.4")).toBe("0.131.0-alpha.4")
   })
 
@@ -1084,6 +1084,25 @@ describe("plugin auth loader", () => {
     expect(JSON.parse(String(fallbackCall[1].body))).toMatchObject({ stream: false, store: false })
     expect(headers.get("Authorization")).toBe("Bearer access-test")
     expect(headers.get("ChatGPT-Account-Id")).toBe("acct_1")
+  })
+
+  test("chat.params forces bundled context window for openai-ws models", async () => {
+    const hooks = await plugin({ client: { auth: { set: vi.fn() } } } as any)
+    const low = { model: { providerID: "openai-ws", id: "gpt-5.4-mini", limit: { context: 200000, output: 128000 } } } as any
+    await hooks["chat.params"]?.(low, { temperature: 0, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} } as any)
+    expect(low.model.limit.context).toBe(272000)
+
+    const missing = { model: { providerID: "openai-ws", id: "gpt-5.4-mini" } } as any
+    await hooks["chat.params"]?.(missing, { temperature: 0, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} } as any)
+    expect(missing.model.limit.context).toBe(272000)
+
+    const other = { model: { providerID: "openai", id: "gpt-5.4-mini", limit: { context: 200000, output: 128000 } } } as any
+    await hooks["chat.params"]?.(other, { temperature: 0, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} } as any)
+    expect(other.model.limit.context).toBe(200000)
+
+    const override = { model: { providerID: "openai-ws", id: "gpt-5.4-mini", limit: { context: 1_000_000, output: 128000 } } } as any
+    await hooks["chat.params"]?.(override, { temperature: 0, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} } as any)
+    expect(override.model.limit.context).toBe(1_000_000)
   })
 
   test("plugin cleanup events close scoped and global pooled connections", async () => {

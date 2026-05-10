@@ -13,6 +13,7 @@ import {
 import { oauthMethods } from "./auth/oauth.js"
 import { extractAccountId, refreshAccessToken, tokenExpiry, type StoredOAuthAuth } from "./auth/tokens.js"
 import { fetchCodexCatalog, fetchOpenAIModelIds } from "./models/catalog.js"
+import { OPENAI_WS_MODELS } from "./models/defaults.js"
 import { resolveModelsForApiKey, resolveModelsForOAuth } from "./models/resolve.js"
 import { prepareHttpFallbackBody } from "./transport/body.js"
 import { bridgeWebSocket } from "./transport/bridge.js"
@@ -25,6 +26,16 @@ type OpenAIWSAuth = ApiAuth | OAuthAuth | undefined
 
 function stableHash(value: unknown): string {
   return crypto.createHash("sha256").update(JSON.stringify(value ?? "")).digest("hex").slice(0, 32)
+}
+
+const DEFAULT_BUNDLED_CONTEXT = 272000
+
+function bundledContextFor(modelID: unknown): number {
+  if (typeof modelID === "string") {
+    const match = OPENAI_WS_MODELS[modelID]
+    if (match?.limit?.context) return match.limit.context
+  }
+  return DEFAULT_BUNDLED_CONTEXT
 }
 
 async function resolveOAuthAuth(auth: OAuthAuth, client: any): Promise<{ accessToken: string; accountId?: string }> {
@@ -65,6 +76,14 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
       headers[INTERNAL_AGENT_HEADER] = input.agent
       headers[INTERNAL_MODEL_HEADER] = input.model.id ?? (input.model as any).modelID
       headers[INTERNAL_PREFIX_HASH_HEADER] = stableHash(input.message)
+    },
+
+    "chat.params": async (input, _output) => {
+      if (input.model.providerID !== PROVIDER_ID) return
+      const model = input.model as { limit?: { context?: number; output?: number } }
+      const bundledContext = bundledContextFor(input.model.id ?? (input.model as any).modelID)
+      if (!model.limit) model.limit = {}
+      if (!model.limit.context || model.limit.context < bundledContext) model.limit.context = bundledContext
     },
 
     event: async ({ event }) => {

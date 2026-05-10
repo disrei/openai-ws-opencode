@@ -21,7 +21,7 @@ export function makeVariants(efforts: string[], includeSummary = true): Record<s
   )
 }
 
-const CODEX_EFFECTIVE_CONTEXT_WINDOW = 258400
+const CODEX_EFFECTIVE_CONTEXT_WINDOW = 272000
 
 export const OPENAI_WS_MODELS: Record<string, OpenAIWSModelDef> = {
   "gpt-5.5": {

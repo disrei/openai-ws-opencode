@@ -1,6 +1,21 @@
 import { OPENAI_API_BASE, PROVIDER_ID } from "../constants.js"
 import type { CodexModelInfo } from "./catalog.js"
-import { codexLimit, makeVariants, OPENAI_WS_MODELS, type OpenAIWSModelDef } from "./defaults.js"
+import { CODEX_EFFECTIVE_CONTEXT_WINDOW, CODEX_OUTPUT_TOKEN_LIMIT, codexLimit, makeVariants, OPENAI_WS_MODELS, type OpenAIWSModelDef } from "./defaults.js"
+
+function positiveFinite(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined
+}
+
+function limitFromCatalog(model: CodexModelInfo, fallback: OpenAIWSModelDef["limit"]): OpenAIWSModelDef["limit"] {
+  const context = positiveFinite(model.max_context_window) ?? positiveFinite(model.context_window) ?? fallback.context
+  const inputCandidate = positiveFinite(model.context_window) ?? positiveFinite(fallback.input) ?? CODEX_EFFECTIVE_CONTEXT_WINDOW
+  const output = positiveFinite(model.max_output_tokens as unknown) ?? positiveFinite(fallback.output) ?? CODEX_OUTPUT_TOKEN_LIMIT
+  return {
+    context,
+    input: Math.min(inputCandidate, context),
+    output,
+  }
+}
 
 export type ProviderModelConfig = {
   id: string
@@ -106,11 +121,14 @@ function modelFromCodexCatalog(model: CodexModelInfo): [string, OpenAIWSModelDef
     .map((level) => level.effort)
     .filter((effort): effort is string => Boolean(effort))
   const reasoning = efforts.length > 0
+  const bundled = OPENAI_WS_MODELS[id]
+  const fallback = bundled?.limit ?? codexLimit()
+  const limit = limitFromCatalog(model, fallback)
   const result: OpenAIWSModelDef = {
     name: `${model.display_name ?? id} (WebSocket)`,
     reasoning,
-    temperature: false,
-    limit: codexLimit(),
+    temperature: bundled?.temperature ?? false,
+    limit,
     variants: reasoning ? makeVariants(efforts, Boolean(model.supports_reasoning_summaries)) : {},
     ...(id.includes("codex") ? { family: "gpt-codex" } : id.endsWith("-pro") ? { family: "gpt-pro" } : {}),
   }
@@ -228,11 +246,29 @@ function sanitizeBuiltInConfigOverride(override: unknown): Record<string, unknow
   return sanitized
 }
 
-export function providerConfigModels(overrides: Record<string, unknown> = {}) {
+function catalogEntriesBySlug(catalog: CodexModelInfo[] | undefined): Map<string, CodexModelInfo> {
+  const entries = new Map<string, CodexModelInfo>()
+  if (!catalog) return entries
+  for (const entry of catalog) {
+    if (typeof entry?.slug === "string" && entry.slug.length > 0) entries.set(entry.slug, entry)
+  }
+  return entries
+}
+
+function bundledModelWithCatalogLimit(id: string, model: OpenAIWSModelDef, catalogEntry: CodexModelInfo | undefined): OpenAIWSModelDef {
+  if (!catalogEntry) return model
+  const limit = limitFromCatalog(catalogEntry, model.limit)
+  if (limit.context === model.limit.context && limit.input === model.limit.input && limit.output === model.limit.output) return model
+  return { ...model, limit }
+}
+
+export function providerConfigModels(overrides: Record<string, unknown> = {}, catalog?: CodexModelInfo[]) {
   const models: Record<string, unknown> = {}
+  const catalogBySlug = catalogEntriesBySlug(catalog)
   for (const [id, model] of Object.entries(OPENAI_WS_MODELS)) {
+    const effective = bundledModelWithCatalogLimit(id, model, catalogBySlug.get(id))
     models[id] = {
-      ...modelToOpenCodeConfig(model),
+      ...modelToOpenCodeConfig(effective),
       ...sanitizeBuiltInConfigOverride(overrides[id]),
     }
   }
@@ -244,11 +280,11 @@ export function providerConfigModels(overrides: Record<string, unknown> = {}) {
   return models
 }
 
-export function providerConfig(overrides: ProviderModelOverrides = {}) {
+export function providerConfig(overrides: ProviderModelOverrides = {}, catalog?: CodexModelInfo[]) {
   return {
     api: OPENAI_API_BASE,
     name: "OpenAI WebSocket",
     npm: "@ai-sdk/openai",
-    models: providerConfigModels(overrides as Record<string, unknown>),
+    models: providerConfigModels(overrides as Record<string, unknown>, catalog),
   }
 }

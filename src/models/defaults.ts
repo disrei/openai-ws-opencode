@@ -24,12 +24,19 @@ export function makeVariants(efforts: string[], includeSummary = true): Record<s
 export const CODEX_EFFECTIVE_CONTEXT_WINDOW = 272000
 export const CODEX_OUTPUT_TOKEN_LIMIT = 128000
 
-export function codexLimit(): OpenAIWSModelDef["limit"] {
+export function codexLimit(overrides: Partial<OpenAIWSModelDef["limit"]> = {}): OpenAIWSModelDef["limit"] {
+  const context = positiveFinite(overrides.context) ?? CODEX_EFFECTIVE_CONTEXT_WINDOW
+  const inputCandidate = positiveFinite(overrides.input) ?? CODEX_EFFECTIVE_CONTEXT_WINDOW
+  const output = positiveFinite(overrides.output) ?? CODEX_OUTPUT_TOKEN_LIMIT
   return {
-    context: CODEX_EFFECTIVE_CONTEXT_WINDOW,
-    input: CODEX_EFFECTIVE_CONTEXT_WINDOW,
-    output: CODEX_OUTPUT_TOKEN_LIMIT,
+    context,
+    input: Math.min(inputCandidate, context),
+    output,
   }
+}
+
+function positiveFinite(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined
 }
 
 export const OPENAI_WS_MODELS: Record<string, OpenAIWSModelDef> = {
@@ -45,7 +52,7 @@ export const OPENAI_WS_MODELS: Record<string, OpenAIWSModelDef> = {
     name: "GPT 5.4 (WebSocket)",
     reasoning: true,
     temperature: true,
-    limit: codexLimit(),
+    limit: codexLimit({ context: 1_000_000 }),
     variants: makeVariants(["low", "medium", "high", "xhigh"], false),
     release_date: "2026-03-05",
   },

@@ -42,6 +42,10 @@ function bundledLimitFor(modelID: unknown): { context: number; input?: number; o
   return DEFAULT_BUNDLED_LIMIT
 }
 
+function isPositiveFinite(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+}
+
 async function resolveOAuthAuth(auth: OAuthAuth, client: any): Promise<{ accessToken: string; accountId?: string }> {
   const expiryBufferMs = 5 * 60 * 1000
   if (auth.access && auth.expires && auth.expires > Date.now() + expiryBufferMs) {
@@ -86,10 +90,19 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
       if (input.model.providerID !== PROVIDER_ID) return
       const model = input.model as { limit?: { context?: number; input?: number; output?: number } }
       const bundledLimit = bundledLimitFor(input.model.id ?? (input.model as any).modelID)
-      if (!model.limit) model.limit = {}
-      model.limit.context = bundledLimit.context
-      model.limit.input = bundledLimit.input ?? bundledLimit.context
-      model.limit.output = bundledLimit.output
+      const current = model.limit ?? {}
+      const context = isPositiveFinite(current.context) ? current.context : bundledLimit.context
+      const inputCandidate = isPositiveFinite(current.input)
+        ? current.input
+        : isPositiveFinite(bundledLimit.input)
+          ? bundledLimit.input
+          : bundledLimit.context
+      const output = isPositiveFinite(current.output) ? current.output : bundledLimit.output
+      model.limit = {
+        context,
+        input: Math.min(inputCandidate, context),
+        output,
+      }
     },
 
     event: async ({ event }) => {

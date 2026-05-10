@@ -488,6 +488,60 @@ describe("setup", () => {
     expect(twice).toBe(once)
   })
 
+  test("bakes catalog-advertised context/input into opencode.json when available", () => {
+    const patched = patchConfigText(
+      "{}",
+      undefined,
+      false,
+      [
+        { slug: "gpt-5.4", context_window: 272000, max_context_window: 1_000_000, prefer_websockets: true },
+        { slug: "gpt-5.5", context_window: 272000, max_context_window: 272000, prefer_websockets: true },
+        { slug: "codex-auto-review", context_window: 272000, max_context_window: 1_000_000, prefer_websockets: true },
+      ] as any,
+    )
+    const models = JSON.parse(patched).provider["openai-ws"].models
+    expect(models["gpt-5.4"].limit).toEqual({ context: 1_000_000, input: 272000, output: 128000 })
+    expect(models["gpt-5.5"].limit).toEqual({ context: 272000, input: 272000, output: 128000 })
+    expect(models["codex-auto-review"]).toBeUndefined()
+  })
+
+  test("falls back to bundled limits when the Codex catalog is absent at setup time", () => {
+    const patched = patchConfigText("{}")
+    const models = JSON.parse(patched).provider["openai-ws"].models
+    expect(models["gpt-5.4"].limit).toEqual({ context: 1_000_000, input: 272000, output: 128000 })
+    expect(models["gpt-5.5"].limit).toEqual({ context: 272000, input: 272000, output: 128000 })
+  })
+
+  test("resolves live catalog best-effort during setup and falls back silently on fetch failure", async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "openai-ws-opencode-catalog-"))
+    try {
+      const file = path.join(dir, "opencode.json")
+
+      await setupOpenCodeConfig({
+        configPath: file,
+        cacheRepair: false,
+        catalogFetch: async () => {
+          throw new Error("offline")
+        },
+      } as any)
+      const offline = JSON.parse(await (await import("node:fs/promises")).readFile(file, "utf8"))
+      expect(offline.provider["openai-ws"].models["gpt-5.4"].limit.context).toBe(1_000_000)
+
+      await setupOpenCodeConfig({
+        configPath: file,
+        cacheRepair: false,
+        catalogFetch: async () => [
+          { slug: "gpt-5.4", context_window: 272000, max_context_window: 1_500_000, max_output_tokens: 200000, prefer_websockets: true },
+          { slug: "gpt-5.5", context_window: 272000, max_context_window: 272000, prefer_websockets: true },
+        ] as any,
+      } as any)
+      const online = JSON.parse(await (await import("node:fs/promises")).readFile(file, "utf8"))
+      expect(online.provider["openai-ws"].models["gpt-5.4"].limit).toEqual({ context: 1_500_000, input: 272000, output: 200000 })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   test("repairs stale plugin-generated model config while preserving custom models", () => {
     const patched = patchConfigText(
       JSON.stringify({
@@ -552,6 +606,7 @@ describe("setup", () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), "openai-ws-opencode-cache-"))
     try {
       process.env.XDG_CACHE_HOME = dir
+      process.env[skipCatalogEnv] = "1"
       const staleEntry = writeOpenCodePackageCache(
         dir,
         "openai-ws-opencode@latest",
@@ -574,6 +629,7 @@ describe("setup", () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), "openai-ws-opencode-cache-"))
     try {
       process.env.XDG_CACHE_HOME = dir
+      process.env[skipCatalogEnv] = "1"
       const currentEntry = writeOpenCodePackageCache(dir, "openai-ws-opencode@latest", "99.0.0", 'export const OAUTH_PORT = 1455\nexport const CODEX_ORIGINATOR = "opencode"\n')
 
       await setupOpenCodeConfig({ configPath: path.join(dir, "opencode.json") })
@@ -589,6 +645,7 @@ describe("setup", () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), "openai-ws-opencode-cache-"))
     try {
       process.env.XDG_CACHE_HOME = dir
+      process.env[skipCatalogEnv] = "1"
       const exactEntry = writeOpenCodePackageCache(dir, "openai-ws-opencode@0.1.1", "0.1.1", "export const OAUTH_PORT = 1456\n")
 
       await setupOpenCodeConfig({ configPath: path.join(dir, "opencode.json") })
@@ -604,6 +661,7 @@ describe("setup", () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), "openai-ws-opencode-cache-"))
     try {
       process.env.XDG_CACHE_HOME = dir
+      process.env[skipCatalogEnv] = "1"
       const staleEntry = writeOpenCodePackageCache(dir, "openai-ws-opencode@latest", "0.1.1", "export const OAUTH_PORT = 1456\n")
 
       await setupOpenCodeConfig({ configPath: path.join(dir, "opencode.json"), cacheRepair: false } as any)
@@ -618,6 +676,7 @@ describe("setup", () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), "openai-ws-opencode-cache-"))
     try {
       process.env.XDG_CACHE_HOME = dir
+      process.env[skipCatalogEnv] = "1"
       const cachePath = path.join(dir, "opencode", "packages", "openai-ws-opencode@latest")
       const configPath = path.join(dir, "opencode.json")
       mkdirSync(path.dirname(cachePath), { recursive: true })
@@ -758,7 +817,10 @@ describe("models", () => {
     expect(models.length).toBeGreaterThan(0)
     expect(models.every((model) => model.providerID === PROVIDER_ID)).toBe(true)
     expect(models.every((model) => model.api.url === "https://api.openai.com/v1")).toBe(true)
-    expect(models.every((model) => model.limit.context === 272000 && model.limit.input === 272000 && model.limit.output > 0)).toBe(true)
+    expect(models.every((model) => model.limit.input === 272000 && model.limit.output > 0)).toBe(true)
+    expect(models.every((model) => model.limit.context >= 272000 && (model.limit.input ?? 0) <= model.limit.context)).toBe(true)
+    expect(resolved["gpt-5.4"].limit).toEqual({ context: 1_000_000, input: 272_000, output: 128_000 })
+    expect(resolved["gpt-5.5"].limit).toEqual({ context: 272_000, input: 272_000, output: 128_000 })
     expect(models.every((model) => model.capabilities.reasoning && model.capabilities.toolcall)).toBe(true)
     expect(models.some((model) => model.family === "gpt-codex")).toBe(true)
     expect(models.some((model) => model.variants.xhigh)).toBe(true)
@@ -781,17 +843,26 @@ describe("models", () => {
     expect(resolved[modelID].providerID).toBe("openai-ws")
   })
 
-  test("resolves OAuth models from the Codex catalog", () => {
+  test("resolves OAuth models from the Codex catalog using catalog-advertised context/input", () => {
     const resolved = resolveModelsForOAuth([
       {
-        slug: "gpt-5.4-codex",
-        display_name: "GPT-5.4 Codex",
-        context_window: 200000,
-        max_context_window: 222222,
-        auto_compact_token_limit: 64000,
-        effective_context_window_percent: 80,
+        slug: "gpt-5.4",
+        display_name: "gpt-5.4",
+        context_window: 272000,
+        max_context_window: 1000000,
+        max_output_tokens: null,
+        auto_compact_token_limit: null,
         prefer_websockets: true,
         supports_reasoning_summaries: true,
+        supported_reasoning_levels: [{ effort: "low" }, { effort: "medium" }, { effort: "high" }, { effort: "xhigh" }],
+      },
+      {
+        slug: "codex-auto-review",
+        display_name: "Codex Auto Review",
+        context_window: 272000,
+        max_context_window: 1000000,
+        max_output_tokens: null,
+        prefer_websockets: true,
         supported_reasoning_levels: [{ effort: "low" }, { effort: "medium" }, { effort: "high" }],
       },
       {
@@ -801,54 +872,72 @@ describe("models", () => {
         prefer_websockets: false,
       },
     ])
-    expect(resolved["gpt-5.4-codex"]).toMatchObject({
-      providerID: "openai-ws",
-      name: "GPT-5.4 Codex (WebSocket)",
-      family: "gpt-codex",
-      limit: { context: 272000, input: 272000, output: 128000 },
-    })
-    expect(resolved["gpt-5.4-codex"].variants.medium).toMatchObject({ reasoningEffort: "medium", reasoningSummary: "auto" })
+    expect(resolved["gpt-5.4"].limit).toEqual({ context: 1_000_000, input: 272_000, output: 128_000 })
+    expect(resolved["codex-auto-review"].limit).toEqual({ context: 1_000_000, input: 272_000, output: 128_000 })
     expect(resolved["non-ws-model"]).toBeUndefined()
   })
 
-  test("uses bundled Codex window instead of catalog or setup limits for OAuth models", () => {
-    const resolved = resolveModelsForOAuth(
-      [
-        {
-          slug: "gpt-5.5",
-          display_name: "GPT-5.5",
-          context_window: 272000,
-          max_context_window: 272000,
-          auto_compact_token_limit: null,
-          prefer_websockets: true,
-          supported_reasoning_levels: [{ effort: "low" }, { effort: "medium" }, { effort: "high" }, { effort: "xhigh" }],
-        },
-      ],
-      {
-        "gpt-5.5": {
-          limit: { context: 1050000, output: 128000 },
-          name: "Bundled setup GPT-5.5",
-        },
-      },
-    )
-
-    expect(resolved["gpt-5.5"].name).toBe("GPT-5.5 (WebSocket)")
-    expect(resolved["gpt-5.5"].limit).toEqual({ context: 272000, input: 272000, output: 128000 })
-  })
-
-  test("uses bundled Codex window when catalog context metadata differs", () => {
+  test("honors catalog max_context_window and caps input to context", () => {
     const resolved = resolveModelsForOAuth([
       {
-        slug: "gpt-5.99",
-        display_name: "GPT-5.99",
+        slug: "gpt-5.4-codex",
+        display_name: "GPT-5.4 Codex",
+        context_window: 200000,
+        max_context_window: 222222,
+        max_output_tokens: 64000,
+        prefer_websockets: true,
+        supports_reasoning_summaries: true,
+        supported_reasoning_levels: [{ effort: "medium" }],
+      },
+      {
+        slug: "gpt-5.future",
+        display_name: "GPT 5 Future",
+        context_window: 400000,
         max_context_window: 300000,
-        effective_context_window_percent: 90,
         prefer_websockets: true,
         supported_reasoning_levels: [{ effort: "high" }],
       },
     ])
+    expect(resolved["gpt-5.4-codex"].limit).toEqual({ context: 222222, input: 200000, output: 64000 })
+    expect(resolved["gpt-5.future"].limit).toEqual({ context: 300000, input: 300000, output: 128000 })
+  })
 
-    expect(resolved["gpt-5.99"].limit).toEqual({ context: 272000, input: 272000, output: 128000 })
+  test("ignores zero or non-numeric catalog limit fields and falls back to bundled", () => {
+    const resolved = resolveModelsForOAuth([
+      {
+        slug: "gpt-5.5",
+        display_name: "GPT-5.5",
+        context_window: 0 as unknown as number,
+        max_context_window: null as unknown as number,
+        max_output_tokens: "huge" as unknown as number,
+        prefer_websockets: true,
+        supported_reasoning_levels: [{ effort: "high" }],
+      },
+    ])
+    expect(resolved["gpt-5.5"].limit).toEqual({ context: 272000, input: 272000, output: 128000 })
+  })
+
+  test("preserves user setup overrides for non-limit fields while catalog limit wins", () => {
+    const resolved = resolveModelsForOAuth(
+      [
+        {
+          slug: "gpt-5.4",
+          display_name: "gpt-5.4",
+          context_window: 272000,
+          max_context_window: 1000000,
+          prefer_websockets: true,
+          supported_reasoning_levels: [{ effort: "medium" }],
+        },
+      ],
+      {
+        "gpt-5.4": {
+          limit: { context: 42, output: 7 },
+          name: "Bundled setup GPT-5.4",
+        } as any,
+      },
+    )
+    expect(resolved["gpt-5.4"].limit).toEqual({ context: 1_000_000, input: 272_000, output: 128_000 })
+    expect(resolved["gpt-5.4"].name).toBe("gpt-5.4 (WebSocket)")
   })
 
   test("falls back to bundled models when the Codex catalog is unavailable or empty", () => {
@@ -902,7 +991,7 @@ describe("models", () => {
 
   test("falls back to package version when Codex client_version metadata is unavailable", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(new Response("nope", { status: 500 }))
-    await expect(resolveCodexClientVersion({ fetchImpl })).resolves.toBe("0.1.22")
+    await expect(resolveCodexClientVersion({ fetchImpl })).resolves.toBe("0.1.23")
     expect(fallbackCodexClientVersion("codex-rs/0.131.0-alpha.4")).toBe("0.131.0-alpha.4")
   })
 
@@ -1116,29 +1205,32 @@ describe("plugin auth loader", () => {
     expect(headers.get("ChatGPT-Account-Id")).toBe("acct_1")
   })
 
-  test("chat.params forces bundled context window for openai-ws models", async () => {
+  test("chat.params trusts live provider limit and fills missing or invalid numbers from bundled defaults", async () => {
     const hooks = await plugin({ client: { auth: { set: vi.fn() } } } as any)
-    const low = { model: { providerID: "openai-ws", id: "gpt-5.4-mini", limit: { context: 200000, output: 128000 } } } as any
-    await hooks["chat.params"]?.(low, { temperature: 0, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} } as any)
-    expect(low.model.limit.context).toBe(272000)
-    expect(low.model.limit.input).toBe(272000)
-    expect(low.model.limit.output).toBe(128000)
+
+    const live = { model: { providerID: "openai-ws", id: "gpt-5.4", limit: { context: 1_000_000, input: 272000, output: 128000 } } } as any
+    await hooks["chat.params"]?.(live, { temperature: 0, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} } as any)
+    expect(live.model.limit).toEqual({ context: 1_000_000, input: 272000, output: 128000 })
+
+    const unknownSlug = { model: { providerID: "openai-ws", id: "codex-auto-review", limit: { context: 1_000_000, input: 272000, output: 128000 } } } as any
+    await hooks["chat.params"]?.(unknownSlug, { temperature: 0, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} } as any)
+    expect(unknownSlug.model.limit).toEqual({ context: 1_000_000, input: 272000, output: 128000 })
 
     const missing = { model: { providerID: "openai-ws", id: "gpt-5.4-mini" } } as any
     await hooks["chat.params"]?.(missing, { temperature: 0, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} } as any)
-    expect(missing.model.limit.context).toBe(272000)
-    expect(missing.model.limit.input).toBe(272000)
-    expect(missing.model.limit.output).toBe(128000)
+    expect(missing.model.limit).toEqual({ context: 272000, input: 272000, output: 128000 })
+
+    const partial = { model: { providerID: "openai-ws", id: "gpt-5.4-mini", limit: { input: 0, output: 128000 } } } as any
+    await hooks["chat.params"]?.(partial, { temperature: 0, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} } as any)
+    expect(partial.model.limit).toEqual({ context: 272000, input: 272000, output: 128000 })
+
+    const unknownMissing = { model: { providerID: "openai-ws", id: "new-gpt-slug" } } as any
+    await hooks["chat.params"]?.(unknownMissing, { temperature: 0, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} } as any)
+    expect(unknownMissing.model.limit).toEqual({ context: 272000, input: 272000, output: 128000 })
 
     const other = { model: { providerID: "openai", id: "gpt-5.4-mini", limit: { context: 200000, output: 128000 } } } as any
     await hooks["chat.params"]?.(other, { temperature: 0, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} } as any)
     expect(other.model.limit.context).toBe(200000)
-
-    const override = { model: { providerID: "openai-ws", id: "gpt-5.4-mini", limit: { context: 1_000_000, output: 128000 } } } as any
-    await hooks["chat.params"]?.(override, { temperature: 0, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} } as any)
-    expect(override.model.limit.context).toBe(272000)
-    expect(override.model.limit.input).toBe(272000)
-    expect(override.model.limit.output).toBe(128000)
   })
 
   test("plugin cleanup events close scoped and global pooled connections", async () => {

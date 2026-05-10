@@ -5,6 +5,7 @@ import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { applyEdits, format, modify, parse } from "jsonc-parser"
+import { fetchCodexCatalog, type CodexModelInfo } from "../src/models/catalog.js"
 import { providerConfig } from "../src/models/resolve.js"
 
 const DEFAULT_PLUGIN_SPEC = "openai-ws-opencode@latest"
@@ -19,6 +20,8 @@ export interface SetupOptions {
   configPath?: string
   pluginSpec?: string
   cacheRepair?: boolean
+  catalog?: CodexModelInfo[]
+  catalogFetch?: () => Promise<CodexModelInfo[] | undefined>
 }
 
 interface CacheRepairOptions {
@@ -68,7 +71,7 @@ function pluginPackageName(specifier: string): string {
   return lastAt > 0 ? specifier.slice(0, lastAt) : specifier
 }
 
-export function patchConfigText(input: string, pluginSpec = DEFAULT_PLUGIN_SPEC, replacePluginSpec = false): string {
+export function patchConfigText(input: string, pluginSpec = DEFAULT_PLUGIN_SPEC, replacePluginSpec = false, catalog?: CodexModelInfo[]): string {
   let text = input.trim() ? input : "{}"
   const config = (parse(text) ?? {}) as Record<string, any>
 
@@ -86,7 +89,7 @@ export function patchConfigText(input: string, pluginSpec = DEFAULT_PLUGIN_SPEC,
 
   const next = (parse(text) ?? {}) as Record<string, any>
   const existingModels = next.provider?.["openai-ws"]?.models ?? {}
-  text = applyJsonPatch(text, ["provider", "openai-ws"], providerConfig(existingModels))
+  text = applyJsonPatch(text, ["provider", "openai-ws"], providerConfig(existingModels, catalog))
 
   return applyEdits(
     text,
@@ -104,6 +107,53 @@ function isNotFound(error: unknown): boolean {
 
 function cacheHomePath(cacheHome = process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), ".cache")): string {
   return cacheHome
+}
+
+const CATALOG_FETCH_TIMEOUT_MS = 1500
+
+interface CodexAuthFile {
+  tokens?: {
+    access_token?: unknown
+    account_id?: unknown
+  }
+}
+
+async function readCodexAuthSnapshot(): Promise<{ accessToken: string; accountId?: string } | undefined> {
+  const file = path.join(os.homedir(), ".codex", "auth.json")
+  let raw: string
+  try {
+    raw = await fs.readFile(file, "utf8")
+  } catch {
+    return undefined
+  }
+  let parsed: CodexAuthFile
+  try {
+    parsed = JSON.parse(raw) as CodexAuthFile
+  } catch {
+    return undefined
+  }
+  const accessToken = typeof parsed?.tokens?.access_token === "string" ? parsed.tokens.access_token : undefined
+  if (!accessToken) return undefined
+  const accountId = typeof parsed?.tokens?.account_id === "string" ? parsed.tokens.account_id : undefined
+  return { accessToken, accountId }
+}
+
+async function resolveLiveCatalog(
+  customFetch?: () => Promise<CodexModelInfo[] | undefined>,
+): Promise<CodexModelInfo[] | undefined> {
+  try {
+    if (customFetch) return await customFetch()
+    if (process.env.OPENAI_WS_OPENCODE_SKIP_CATALOG === "1") return undefined
+    const snapshot = await readCodexAuthSnapshot()
+    if (!snapshot) return undefined
+    return await fetchCodexCatalog({
+      accessToken: snapshot.accessToken,
+      accountId: snapshot.accountId,
+      timeoutMs: CATALOG_FETCH_TIMEOUT_MS,
+    })
+  } catch {
+    return undefined
+  }
 }
 
 function openCodeLatestCachePath(cacheHome?: string): string {
@@ -231,7 +281,8 @@ export async function setupOpenCodeConfig(options: SetupOptions = {}): Promise<s
     if (error?.code !== "ENOENT") throw error
   }
 
-  const updated = patchConfigText(existing, options.pluginSpec ?? DEFAULT_PLUGIN_SPEC, Boolean(options.pluginSpec))
+  const catalog = options.catalog ?? (await resolveLiveCatalog(options.catalogFetch))
+  const updated = patchConfigText(existing, options.pluginSpec ?? DEFAULT_PLUGIN_SPEC, Boolean(options.pluginSpec), catalog)
   await fs.mkdir(path.dirname(file), { recursive: true })
   await fs.writeFile(file, updated.endsWith("\n") ? updated : `${updated}\n`, "utf8")
   if (options.cacheRepair !== false) {

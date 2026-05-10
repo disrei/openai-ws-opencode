@@ -23,6 +23,7 @@ export type CodexModelInfo = {
   description?: string
   context_window?: number
   max_context_window?: number
+  max_output_tokens?: number | null
   effective_context_window_percent?: number
   supported_in_api?: boolean
   priority?: number

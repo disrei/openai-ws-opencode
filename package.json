@@ -1,6 +1,6 @@
 {
   "name": "openai-ws-opencode",
-  "version": "0.1.19",
+  "version": "0.1.20",
   "description": "OpenCode plugin for OpenAI Responses WebSocket transport.",
   "type": "module",
   "license": "MIT",

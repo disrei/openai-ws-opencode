@@ -19,6 +19,7 @@ import {
   INTERNAL_MODEL_HEADER,
   INTERNAL_PREFIX_HASH_HEADER,
   INTERNAL_SESSION_HEADER,
+  BACKGROUND_ORCHESTRATION_ENV,
   OPENAI_WS_BETA,
   OPENAI_WS_INSTALLATION_ID_ENV,
   PROVIDER_ID,
@@ -358,6 +359,7 @@ function unmaskWirePayload(payload: Uint8Array, mask: Uint8Array): Buffer {
 
 const originalXdgCacheHome = process.env.XDG_CACHE_HOME
 const originalInstallationID = process.env[OPENAI_WS_INSTALLATION_ID_ENV]
+const originalBackgroundOrchestration = process.env[BACKGROUND_ORCHESTRATION_ENV]
 const originalResponseProcessed = process.env[RESPONSE_PROCESSED_ENV]
 const originalResponseProcessedDisable = process.env[RESPONSE_PROCESSED_DISABLE_ENV]
 const originalOpenAIOrganization = process.env.OPENAI_ORGANIZATION
@@ -376,6 +378,8 @@ afterEach(() => {
   else process.env.XDG_CACHE_HOME = originalXdgCacheHome
   if (originalInstallationID === undefined) delete process.env[OPENAI_WS_INSTALLATION_ID_ENV]
   else process.env[OPENAI_WS_INSTALLATION_ID_ENV] = originalInstallationID
+  if (originalBackgroundOrchestration === undefined) delete process.env[BACKGROUND_ORCHESTRATION_ENV]
+  else process.env[BACKGROUND_ORCHESTRATION_ENV] = originalBackgroundOrchestration
   if (originalResponseProcessed === undefined) delete process.env[RESPONSE_PROCESSED_ENV]
   else process.env[RESPONSE_PROCESSED_ENV] = originalResponseProcessed
   if (originalResponseProcessedDisable === undefined) delete process.env[RESPONSE_PROCESSED_DISABLE_ENV]
@@ -673,13 +677,18 @@ describe("body and headers", () => {
       },
     })
     expect(api).not.toHaveProperty("stream_options")
+    expect(prepareBody({ stream: true }, false)).not.toHaveProperty("background")
 
     const oauth = prepareBody({ stream: true, max_output_tokens: 10, max_tokens: 10 }, true)
+    expect(oauth).not.toHaveProperty("background")
     expect(oauth.store).toBe(false)
     expect(oauth.stream).toBe(true)
     expect(oauth.instructions).toBe("You are a helpful assistant.")
     expect(oauth).not.toHaveProperty("max_output_tokens")
     expect(oauth).not.toHaveProperty("max_tokens")
+
+    process.env[BACKGROUND_ORCHESTRATION_ENV] = "1"
+    expect(prepareBody({ stream: true }, false).background).toBe(true)
   })
 
   test("canonicalizes response input items for the websocket endpoint", () => {
@@ -1184,22 +1193,22 @@ describe("websocket bridge", () => {
     expect(sentFrames(ws)[0]).toMatchObject({
       type: "response.create",
       model: "gpt-5.4-mini",
-      background: true,
       instructions: "You are a helpful assistant.",
       input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
       store: false,
       stream: true,
     })
+    expect(sentFrames(ws)[0]).not.toHaveProperty("background")
   })
 
   test("can opt out of default background websocket responses for foreground compatibility", async () => {
-    process.env.OPENAI_WS_OPENCODE_BACKGROUND_ORCHESTRATION = "0"
+    process.env[BACKGROUND_ORCHESTRATION_ENV] = "0"
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const response = bridgeWebSocket(
       "wss://example.test/responses",
-      apiKeyWebSocketHeaders("api-key-test"),
+      oauthWebSocketHeaders("access-test", "acct_1"),
       { model: "gpt-5.4-mini", input: "hi", stream: true },
-      false,
+      true,
     )
     const ws = MockWebSocket.instances[0]
     ws.open()

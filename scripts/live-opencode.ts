@@ -19,6 +19,7 @@ const serverStartTimeoutMs = numberEnv("OPENAI_WS_LIVE_SERVER_START_MS", 15_000)
 const compactTimeoutMs = numberEnv("OPENAI_WS_LIVE_COMPACT_TIMEOUT_MS", 90_000)
 const requireAuth = process.env.OPENAI_WS_LIVE === "1" || process.env.OPENAI_WS_LIVE_REQUIRED === "1"
 const keepArtifacts = process.env.OPENAI_WS_LIVE_KEEP_ARTIFACTS === "1"
+const fullHarness = process.env.OPENAI_WS_LIVE_FULL === "1" || process.env.OPENAI_WS_LIVE_MODE === "full"
 let opencodeEnv: NodeJS.ProcessEnv = {}
 
 type CommandResult = {
@@ -783,6 +784,30 @@ async function main() {
     await assertIncludes(tool, toolNonce, "tool response", projectDir, artifactsDir)
     if (!tool.sawTool) throw new Error(`tool-use completed but no tool activity was observed\n${redact(tail(tool.stdout || tool.stderr))}`)
 
+    const abort = await runAbortTurn(
+      "abort-after-stream",
+      "Start your answer immediately with ABORT_STREAM_STARTED, then repeat ABORT_STREAM_STARTED one hundred times separated by spaces. Do not use tools.",
+      projectDir,
+      artifactsDir,
+    )
+    if (!abort.streamStarted) throw new Error("abort-after-stream closed before any stream evidence was observed")
+
+    if (!fullHarness) {
+      success = true
+      console.log(`Live OpenCode smoke harness passed with ${model}.`)
+      return
+    }
+
+    const recoveryNonce = nonce("RECOVERY")
+    const recovery = await runLiveTurn(
+      "post-abort-recovery",
+      `Reply exactly ${recoveryNonce} and nothing else.`,
+      projectDir,
+      artifactsDir,
+    )
+    assertRuntimeTurn(recovery, "post-abort recovery response")
+    await assertIncludes(recovery, recoveryNonce, "post-abort recovery response", projectDir, artifactsDir)
+
     const continueNonce = nonce("CONT")
     const first = await runLiveTurn(
       "continue-first",
@@ -855,31 +880,13 @@ async function main() {
       await compactServer.stop()
     }
 
-    const abort = await runAbortTurn(
-      "abort-after-stream",
-      "Start your answer immediately with ABORT_STREAM_STARTED, then repeat ABORT_STREAM_STARTED one hundred times separated by spaces. Do not use tools.",
-      projectDir,
-      artifactsDir,
-    )
-    if (!abort.streamStarted) throw new Error("abort-after-stream closed before any stream evidence was observed")
-
-    const recoveryNonce = nonce("RECOVERY")
-    const recovery = await runLiveTurn(
-      "post-abort-recovery",
-      `Reply exactly ${recoveryNonce} and nothing else.`,
-      projectDir,
-      artifactsDir,
-    )
-    assertRuntimeTurn(recovery, "post-abort recovery response")
-    await assertIncludes(recovery, recoveryNonce, "post-abort recovery response", projectDir, artifactsDir)
-
     const largeNonce = nonce("LARGE")
     const large = await runLiveTurn("large-context", largeContextPrompt(largeNonce), projectDir, artifactsDir)
     assertRuntimeTurn(large, "large context response")
     await assertIncludes(large, largeNonce, "large context response", projectDir, artifactsDir)
 
     success = true
-    console.log(`Live OpenCode harness passed with ${model}.`)
+    console.log(`Live OpenCode full harness passed with ${model}.`)
   } catch (error) {
     console.error(`Live OpenCode harness failed. Artifacts: ${artifactsDir}`)
     throw error

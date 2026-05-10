@@ -59,7 +59,7 @@ function normalizeInput(input: unknown): unknown {
 }
 
 function shouldUseBackgroundResponses(): boolean {
-  return process.env[BACKGROUND_ORCHESTRATION_ENV] !== "0"
+  return process.env[BACKGROUND_ORCHESTRATION_ENV] === "1"
 }
 
 export function prepareBody(

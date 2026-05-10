@@ -488,7 +488,7 @@ describe("setup", () => {
     expect(twice).toBe(once)
   })
 
-  test("bakes catalog-advertised context/input into opencode.json when available", () => {
+  test("bakes catalog-advertised context_window into opencode.json when available", () => {
     const patched = patchConfigText(
       "{}",
       undefined,
@@ -500,7 +500,7 @@ describe("setup", () => {
       ] as any,
     )
     const models = JSON.parse(patched).provider["openai-ws"].models
-    expect(models["gpt-5.4"].limit).toEqual({ context: 1_000_000, input: 272000, output: 128000 })
+    expect(models["gpt-5.4"].limit).toEqual({ context: 272000, input: 272000, output: 128000 })
     expect(models["gpt-5.5"].limit).toEqual({ context: 272000, input: 272000, output: 128000 })
     expect(models["codex-auto-review"]).toBeUndefined()
   })
@@ -508,7 +508,7 @@ describe("setup", () => {
   test("falls back to bundled limits when the Codex catalog is absent at setup time", () => {
     const patched = patchConfigText("{}")
     const models = JSON.parse(patched).provider["openai-ws"].models
-    expect(models["gpt-5.4"].limit).toEqual({ context: 1_000_000, input: 272000, output: 128000 })
+    expect(models["gpt-5.4"].limit).toEqual({ context: 272000, input: 272000, output: 128000 })
     expect(models["gpt-5.5"].limit).toEqual({ context: 272000, input: 272000, output: 128000 })
   })
 
@@ -525,18 +525,18 @@ describe("setup", () => {
         },
       } as any)
       const offline = JSON.parse(await (await import("node:fs/promises")).readFile(file, "utf8"))
-      expect(offline.provider["openai-ws"].models["gpt-5.4"].limit.context).toBe(1_000_000)
+      expect(offline.provider["openai-ws"].models["gpt-5.4"].limit.context).toBe(272000)
 
       await setupOpenCodeConfig({
         configPath: file,
         cacheRepair: false,
         catalogFetch: async () => [
-          { slug: "gpt-5.4", context_window: 272000, max_context_window: 1_500_000, max_output_tokens: 200000, prefer_websockets: true },
+          { slug: "gpt-5.4", context_window: 400000, max_context_window: 1_500_000, max_output_tokens: 200000, prefer_websockets: true },
           { slug: "gpt-5.5", context_window: 272000, max_context_window: 272000, prefer_websockets: true },
         ] as any,
       } as any)
       const online = JSON.parse(await (await import("node:fs/promises")).readFile(file, "utf8"))
-      expect(online.provider["openai-ws"].models["gpt-5.4"].limit).toEqual({ context: 1_500_000, input: 272000, output: 200000 })
+      expect(online.provider["openai-ws"].models["gpt-5.4"].limit).toEqual({ context: 400000, input: 400000, output: 200000 })
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -817,10 +817,7 @@ describe("models", () => {
     expect(models.length).toBeGreaterThan(0)
     expect(models.every((model) => model.providerID === PROVIDER_ID)).toBe(true)
     expect(models.every((model) => model.api.url === "https://api.openai.com/v1")).toBe(true)
-    expect(models.every((model) => model.limit.input === 272000 && model.limit.output > 0)).toBe(true)
-    expect(models.every((model) => model.limit.context >= 272000 && (model.limit.input ?? 0) <= model.limit.context)).toBe(true)
-    expect(resolved["gpt-5.4"].limit).toEqual({ context: 1_000_000, input: 272_000, output: 128_000 })
-    expect(resolved["gpt-5.5"].limit).toEqual({ context: 272_000, input: 272_000, output: 128_000 })
+    expect(models.every((model) => model.limit.context === 272_000 && model.limit.input === 272_000 && model.limit.output > 0)).toBe(true)
     expect(models.every((model) => model.capabilities.reasoning && model.capabilities.toolcall)).toBe(true)
     expect(models.some((model) => model.family === "gpt-codex")).toBe(true)
     expect(models.some((model) => model.variants.xhigh)).toBe(true)
@@ -843,7 +840,7 @@ describe("models", () => {
     expect(resolved[modelID].providerID).toBe("openai-ws")
   })
 
-  test("resolves OAuth models from the Codex catalog using catalog-advertised context/input", () => {
+  test("resolves OAuth models from the Codex catalog using effective context_window", () => {
     const resolved = resolveModelsForOAuth([
       {
         slug: "gpt-5.4",
@@ -872,12 +869,12 @@ describe("models", () => {
         prefer_websockets: false,
       },
     ])
-    expect(resolved["gpt-5.4"].limit).toEqual({ context: 1_000_000, input: 272_000, output: 128_000 })
-    expect(resolved["codex-auto-review"].limit).toEqual({ context: 1_000_000, input: 272_000, output: 128_000 })
+    expect(resolved["gpt-5.4"].limit).toEqual({ context: 272_000, input: 272_000, output: 128_000 })
+    expect(resolved["codex-auto-review"].limit).toEqual({ context: 272_000, input: 272_000, output: 128_000 })
     expect(resolved["non-ws-model"]).toBeUndefined()
   })
 
-  test("honors catalog max_context_window and caps input to context", () => {
+  test("prefers catalog context_window and falls back to max_context_window when absent", () => {
     const resolved = resolveModelsForOAuth([
       {
         slug: "gpt-5.4-codex",
@@ -892,14 +889,13 @@ describe("models", () => {
       {
         slug: "gpt-5.future",
         display_name: "GPT 5 Future",
-        context_window: 400000,
         max_context_window: 300000,
         prefer_websockets: true,
         supported_reasoning_levels: [{ effort: "high" }],
       },
     ])
-    expect(resolved["gpt-5.4-codex"].limit).toEqual({ context: 222222, input: 200000, output: 64000 })
-    expect(resolved["gpt-5.future"].limit).toEqual({ context: 300000, input: 300000, output: 128000 })
+    expect(resolved["gpt-5.4-codex"].limit).toEqual({ context: 200000, input: 200000, output: 64000 })
+    expect(resolved["gpt-5.future"].limit).toEqual({ context: 300000, input: 272000, output: 128000 })
   })
 
   test("ignores zero or non-numeric catalog limit fields and falls back to bundled", () => {
@@ -936,7 +932,7 @@ describe("models", () => {
         } as any,
       },
     )
-    expect(resolved["gpt-5.4"].limit).toEqual({ context: 1_000_000, input: 272_000, output: 128_000 })
+    expect(resolved["gpt-5.4"].limit).toEqual({ context: 272_000, input: 272_000, output: 128_000 })
     expect(resolved["gpt-5.4"].name).toBe("gpt-5.4 (WebSocket)")
   })
 
@@ -991,7 +987,7 @@ describe("models", () => {
 
   test("falls back to package version when Codex client_version metadata is unavailable", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(new Response("nope", { status: 500 }))
-    await expect(resolveCodexClientVersion({ fetchImpl })).resolves.toBe("0.1.23")
+    await expect(resolveCodexClientVersion({ fetchImpl })).resolves.toBe("0.1.24")
     expect(fallbackCodexClientVersion("codex-rs/0.131.0-alpha.4")).toBe("0.131.0-alpha.4")
   })
 
@@ -1208,13 +1204,13 @@ describe("plugin auth loader", () => {
   test("chat.params trusts live provider limit and fills missing or invalid numbers from bundled defaults", async () => {
     const hooks = await plugin({ client: { auth: { set: vi.fn() } } } as any)
 
-    const live = { model: { providerID: "openai-ws", id: "gpt-5.4", limit: { context: 1_000_000, input: 272000, output: 128000 } } } as any
+    const live = { model: { providerID: "openai-ws", id: "gpt-5.4", limit: { context: 400_000, input: 400_000, output: 200_000 } } } as any
     await hooks["chat.params"]?.(live, { temperature: 0, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} } as any)
-    expect(live.model.limit).toEqual({ context: 1_000_000, input: 272000, output: 128000 })
+    expect(live.model.limit).toEqual({ context: 400_000, input: 400_000, output: 200_000 })
 
-    const unknownSlug = { model: { providerID: "openai-ws", id: "codex-auto-review", limit: { context: 1_000_000, input: 272000, output: 128000 } } } as any
+    const unknownSlug = { model: { providerID: "openai-ws", id: "codex-auto-review", limit: { context: 400_000, input: 400_000, output: 200_000 } } } as any
     await hooks["chat.params"]?.(unknownSlug, { temperature: 0, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} } as any)
-    expect(unknownSlug.model.limit).toEqual({ context: 1_000_000, input: 272000, output: 128000 })
+    expect(unknownSlug.model.limit).toEqual({ context: 400_000, input: 400_000, output: 200_000 })
 
     const missing = { model: { providerID: "openai-ws", id: "gpt-5.4-mini" } } as any
     await hooks["chat.params"]?.(missing, { temperature: 0, topP: 1, topK: 0, maxOutputTokens: undefined, options: {} } as any)

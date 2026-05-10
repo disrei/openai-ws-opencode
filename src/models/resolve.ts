@@ -7,7 +7,7 @@ function positiveFinite(value: unknown): number | undefined {
 }
 
 function limitFromCatalog(model: CodexModelInfo, fallback: OpenAIWSModelDef["limit"]): OpenAIWSModelDef["limit"] {
-  const context = positiveFinite(model.max_context_window) ?? positiveFinite(model.context_window) ?? fallback.context
+  const context = positiveFinite(model.context_window) ?? positiveFinite(model.max_context_window) ?? fallback.context
   const inputCandidate = positiveFinite(model.context_window) ?? positiveFinite(fallback.input) ?? CODEX_EFFECTIVE_CONTEXT_WINDOW
   const output = positiveFinite(model.max_output_tokens as unknown) ?? positiveFinite(fallback.output) ?? CODEX_OUTPUT_TOKEN_LIMIT
   return {

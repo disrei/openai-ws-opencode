@@ -52,7 +52,7 @@ export const OPENAI_WS_MODELS: Record<string, OpenAIWSModelDef> = {
     name: "GPT 5.4 (WebSocket)",
     reasoning: true,
     temperature: true,
-    limit: codexLimit({ context: 1_000_000 }),
+    limit: codexLimit(),
     variants: makeVariants(["low", "medium", "high", "xhigh"], false),
     release_date: "2026-03-05",
   },

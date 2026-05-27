@@ -808,6 +808,71 @@ describe("body and headers", () => {
       "User-Agent": USER_AGENT,
     })
   })
+
+  test("chat.headers forwards session, agent, and model without auto prompt_cache_key", async () => {
+    const hooks = await plugin({ client: { auth: { set: vi.fn() } } } as any)
+    const output = { headers: {} as Record<string, string> }
+    await hooks["chat.headers"]?.(
+      { sessionID: "sess_1", agent: "primary", model: { providerID: "custom-ws", id: "gpt-5.4" } as any, provider: {} as any, message: { id: "msg_1" } as any },
+      output,
+    )
+
+    expect(output.headers).toMatchObject({
+      [INTERNAL_SESSION_HEADER]: "sess_1",
+      [INTERNAL_AGENT_HEADER]: "primary",
+      [INTERNAL_MODEL_HEADER]: "gpt-5.4",
+    })
+    expect(output.headers[INTERNAL_PREFIX_HASH_HEADER]).toBeUndefined()
+  })
+
+  test("chat.headers avoids auto prompt_cache_key collisions across different user content", async () => {
+    const hooks = await plugin({ client: { auth: { set: vi.fn() } } } as any)
+
+    const first = { headers: {} as Record<string, string> }
+    await hooks["chat.headers"]?.(
+      {
+        sessionID: "sess_1",
+        agent: "primary",
+        model: { providerID: "custom-ws", id: "gpt-5.4" } as any,
+        provider: {} as any,
+        message: {
+          id: "msg_1",
+          sessionID: "sess_1",
+          role: "user",
+          time: { created: 1 },
+          agent: "primary",
+          model: { providerID: "custom-ws", modelID: "gpt-5.4" },
+          system: "You are a coder.",
+          parts: [{ type: "text", text: "First user prompt" }],
+        } as any,
+      },
+      first,
+    )
+
+    const second = { headers: {} as Record<string, string> }
+    await hooks["chat.headers"]?.(
+      {
+        sessionID: "sess_1",
+        agent: "primary",
+        model: { providerID: "custom-ws", id: "gpt-5.4" } as any,
+        provider: {} as any,
+        message: {
+          id: "msg_2",
+          sessionID: "sess_1",
+          role: "user",
+          time: { created: 2 },
+          agent: "primary",
+          model: { providerID: "custom-ws", modelID: "gpt-5.4" },
+          system: "You are a coder.",
+          parts: [{ type: "text", text: "Different user prompt and history" }],
+        } as any,
+      },
+      second,
+    )
+
+    expect(first.headers[INTERNAL_PREFIX_HASH_HEADER]).toBeUndefined()
+    expect(second.headers[INTERNAL_PREFIX_HASH_HEADER]).toBeUndefined()
+  })
 })
 
 describe("models", () => {

@@ -5,13 +5,19 @@ import {
   X_CODEX_WINDOW_ID_HEADER,
   X_OPENAI_SUBAGENT_HEADER,
 } from "../constants.js"
+import crypto from "node:crypto"
 import type { TransportContext } from "./headers.js"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 
 const LOG_FILE = path.join(os.tmpdir(), "openai-ws-opencode.log")
+function verboseLogEnabled() {
+  return process.env.OPENAI_WS_OPENCODE_VERBOSE_LOG === "1"
+}
+
 function wsLog(msg: string) {
+  if (!verboseLogEnabled()) return
   try {
     fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`)
   } catch {}
@@ -72,6 +78,40 @@ function shouldUseBackgroundResponses(): boolean {
   return process.env[BACKGROUND_ORCHESTRATION_ENV] === "1"
 }
 
+function stableJson(value: unknown): string {
+  if (value === null || value === undefined) return "null"
+  if (typeof value === "string") return JSON.stringify(value)
+  if (typeof value === "number" || typeof value === "boolean") return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(",")}}`
+  }
+  return JSON.stringify(String(value))
+}
+
+function promptCacheHash(value: unknown): string {
+  return crypto.createHash("sha256").update(stableJson(value)).digest("hex").slice(0, 32)
+}
+
+function developerPrefixSeed(requestBody: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (!Array.isArray(requestBody.input) || requestBody.input.length === 0) return undefined
+  const first = requestBody.input[0]
+  if (!first || typeof first !== "object" || Array.isArray(first)) return undefined
+  const firstMessage = first as Record<string, unknown>
+  if (firstMessage.type !== "message" || firstMessage.role !== "developer") return undefined
+  return {
+    model: requestBody.model ?? null,
+    instructions: requestBody.instructions ?? null,
+    include: requestBody.include ?? null,
+    reasoning: requestBody.reasoning ?? null,
+    text: requestBody.text ?? null,
+    tool_choice: requestBody.tool_choice ?? null,
+    tools: requestBody.tools ?? null,
+    first_message: firstMessage,
+  }
+}
+
 export function prepareBody(
   requestBody: Record<string, unknown>,
   isOAuth: boolean,
@@ -90,7 +130,11 @@ export function prepareBody(
   if (isOAuth) {
     delete wsBody.max_tokens
   }
-  if (wsBody.prompt_cache_key === undefined && context.stablePrefixHash) wsBody.prompt_cache_key = context.stablePrefixHash
+  if (wsBody.prompt_cache_key === undefined) {
+    const seed = developerPrefixSeed(wsBody)
+    if (seed) wsBody.prompt_cache_key = promptCacheHash(seed)
+    else if (context.stablePrefixHash) wsBody.prompt_cache_key = context.stablePrefixHash
+  }
   const clientMetadata = mergeClientMetadata(wsBody, context)
   if (clientMetadata) wsBody.client_metadata = clientMetadata
 

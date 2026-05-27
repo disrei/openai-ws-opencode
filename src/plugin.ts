@@ -1,5 +1,4 @@
 import type { Hooks, Plugin } from "@opencode-ai/plugin"
-import crypto from "node:crypto"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -8,7 +7,6 @@ import {
   CODEX_API_ENDPOINT,
   INTERNAL_AGENT_HEADER,
   INTERNAL_MODEL_HEADER,
-  INTERNAL_PREFIX_HASH_HEADER,
   INTERNAL_SESSION_HEADER,
   OPENAI_API_BASE,
   OPENAI_WS_URL,
@@ -27,7 +25,12 @@ import { closeConnections, ensureWarmConnection, invalidateStaleAuthConnections 
 import { extractTransportContext, httpAuthHeaders, transportIdentity, customProviderTransportIdentity } from "./transport/headers.js"
 
 const LOG_FILE = path.join(os.tmpdir(), "openai-ws-opencode.log")
+function verboseLogEnabled() {
+  return process.env.OPENAI_WS_OPENCODE_VERBOSE_LOG === "1"
+}
+
 function wsLog(msg: string) {
+  if (!verboseLogEnabled()) return
   try {
     fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`)
   } catch {}
@@ -36,10 +39,6 @@ function wsLog(msg: string) {
 type ApiAuth = { type: "api"; key?: string }
 type OAuthAuth = StoredOAuthAuth
 type OpenAIWSAuth = ApiAuth | OAuthAuth | undefined
-
-function stableHash(value: unknown): string {
-  return crypto.createHash("sha256").update(JSON.stringify(value ?? "")).digest("hex").slice(0, 32)
-}
 
 const DEFAULT_BUNDLED_LIMIT = {
   context: CODEX_EFFECTIVE_CONTEXT_WINDOW,
@@ -110,15 +109,14 @@ function extractApiKeyFromOptions(provider: any): string | undefined {
 
 const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
   wsLog("=== Plugin initialized ===")
-  console.error("[openai-ws] Plugin initialized!")
   const hooks: Hooks = {
     "chat.headers": async (input, output) => {
       if (input.model.providerID !== CUSTOM_PROVIDER_ID) return
       const headers = (output.headers ??= {})
       headers[INTERNAL_SESSION_HEADER] = input.sessionID
       headers[INTERNAL_AGENT_HEADER] = input.agent
-      headers[INTERNAL_MODEL_HEADER] = input.model.id ?? (input.model as any).modelID
-      headers[INTERNAL_PREFIX_HASH_HEADER] = stableHash(input.message)
+      const modelID = input.model.id ?? (input.model as any).modelID
+      headers[INTERNAL_MODEL_HEADER] = modelID
     },
 
     "chat.params": async (input, _output) => {

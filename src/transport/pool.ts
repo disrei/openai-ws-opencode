@@ -1,4 +1,7 @@
 import crypto from "node:crypto"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
 import {
   CODEX_WS_URL,
   OPENAI_MODEL_HEADER,
@@ -17,6 +20,13 @@ import { transportConfig } from "./config.js"
 import type { TransportContext } from "./headers.js"
 
 let WebSocketImpl: WebSocketConstructor = loadDefaultWebSocketConstructor()
+const LOG_FILE = path.join(os.tmpdir(), "openai-ws-opencode.log")
+
+function wsLog(msg: string) {
+  try {
+    fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`)
+  } catch {}
+}
 
 type PendingMetadata = {
   responseId?: string
@@ -103,6 +113,7 @@ type QueueEntry = {
 const acquisitionQueues = new Map<string, QueueEntry[]>()
 const turnStateByContext = new Map<string, string>()
 const lastResponseIDByContext = new Map<string, string>()
+const lastDeveloperPromptHashByContext = new Map<string, string>()
 let nextConnectionID = 1
 
 export const readyState = {
@@ -129,6 +140,169 @@ function authScopeHash(headers: Record<string, string>): string {
     .map(([key, value]) => `${key}:${value}`)
     .join("\n")
   return crypto.createHash("sha256").update(auth).digest("hex")
+}
+
+function hashForLog(value: unknown): string {
+  return crypto.createHash("sha256").update(JSON.stringify(value ?? null)).digest("hex").slice(0, 16)
+}
+
+function usageForLog(frame: Record<string, unknown>): Record<string, unknown> | undefined {
+  const usage =
+    frame.usage && typeof frame.usage === "object" && !Array.isArray(frame.usage)
+      ? (frame.usage as Record<string, unknown>)
+      : frame.response && typeof frame.response === "object" && !Array.isArray(frame.response) && (frame.response as Record<string, unknown>).usage && typeof (frame.response as Record<string, unknown>).usage === "object"
+        ? ((frame.response as Record<string, unknown>).usage as Record<string, unknown>)
+        : undefined
+  if (!usage) return undefined
+  return {
+    input_tokens: usage.input_tokens,
+    output_tokens: usage.output_tokens,
+    total_tokens: usage.total_tokens,
+    input_cached_tokens: usage.input_cached_tokens,
+    cached_tokens: usage.cached_tokens,
+    prompt_tokens_details: usage.prompt_tokens_details,
+  }
+}
+
+function stringLengthForLog(value: unknown): number {
+  return typeof value === "string" ? value.length : 0
+}
+
+function inputSummaryForLog(input: unknown): Record<string, unknown> {
+  if (typeof input === "string") {
+    return {
+      input_type: "string",
+      input_messages: 1,
+      input_chars: input.length,
+    }
+  }
+  if (!Array.isArray(input)) {
+    return {
+      input_type: typeof input,
+      input_messages: 0,
+      input_chars: 0,
+    }
+  }
+
+  let chars = 0
+  let messages = 0
+  for (const item of input) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue
+    const value = item as Record<string, unknown>
+    if (value.type === "message") messages += 1
+    const content = value.content
+    if (typeof content === "string") {
+      chars += content.length
+      continue
+    }
+    if (!Array.isArray(content)) continue
+    for (const part of content) {
+      if (!part || typeof part !== "object" || Array.isArray(part)) continue
+      const partValue = part as Record<string, unknown>
+      chars += stringLengthForLog(partValue.text)
+      chars += stringLengthForLog(partValue.input_text)
+      chars += stringLengthForLog(partValue.output_text)
+    }
+  }
+
+  return {
+    input_type: "array",
+    input_messages: messages,
+    input_chars: chars,
+  }
+}
+
+function previewForLog(value: string, max = 120): string {
+  const normalized = value.replace(/\s+/g, " ").trim()
+  return normalized.length <= max ? normalized : `${normalized.slice(0, max)}...`
+}
+
+function messageContentStatsForLog(content: unknown): { chars: number; preview: string } {
+  if (typeof content === "string") {
+    return { chars: content.length, preview: previewForLog(content) }
+  }
+  if (!Array.isArray(content)) {
+    return { chars: 0, preview: "" }
+  }
+
+  let chars = 0
+  const previewParts: string[] = []
+  for (const part of content) {
+    if (!part || typeof part !== "object" || Array.isArray(part)) continue
+    const value = part as Record<string, unknown>
+    const textValues = [value.text, value.input_text, value.output_text].filter((item): item is string => typeof item === "string")
+    for (const text of textValues) {
+      chars += text.length
+      if (previewParts.length < 3) previewParts.push(previewForLog(text, 60))
+    }
+  }
+  return { chars, preview: previewParts.join(" | ") }
+}
+
+function inputMessagesForLog(input: unknown): string {
+  if (!Array.isArray(input)) return ""
+  const messages: string[] = []
+  for (const [index, item] of input.entries()) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue
+    const value = item as Record<string, unknown>
+    const role = typeof value.role === "string" ? value.role : "unknown"
+    const type = typeof value.type === "string" ? value.type : "unknown"
+    const stats = messageContentStatsForLog(value.content)
+    messages.push(`#${index}:${type}/${role}:chars=${stats.chars}:preview=${stats.preview || "-"}`)
+  }
+  return messages.join(" || ")
+}
+
+function developerPromptHashForLog(input: unknown): string | undefined {
+  if (!Array.isArray(input) || input.length === 0) return undefined
+  const first = input[0]
+  if (!first || typeof first !== "object" || Array.isArray(first)) return undefined
+  const value = first as Record<string, unknown>
+  if (value.type !== "message" || value.role !== "developer") return undefined
+  return hashForLog(value.content)
+}
+
+function toolCountForLog(tools: unknown): number {
+  return Array.isArray(tools) ? tools.length : 0
+}
+
+function logRequestForDebug(conn: PooledConnection, body: Record<string, unknown>) {
+  const inputSummary = inputSummaryForLog(body.input)
+  const inputMessages = inputMessagesForLog(body.input)
+  const developerPromptHash = developerPromptHashForLog(body.input)
+  const priorDeveloperPromptHash = lastDeveloperPromptHashByContext.get(conn.contextKey)
+  const developerPromptStable = developerPromptHash
+    ? priorDeveloperPromptHash === undefined
+      ? "first"
+      : String(priorDeveloperPromptHash === developerPromptHash)
+    : "absent"
+  if (developerPromptHash) lastDeveloperPromptHashByContext.set(conn.contextKey, developerPromptHash)
+  wsLog(
+    `[kv-debug] request conn=${conn.id} session=${conn.activeSessionID ?? conn.lastSessionID ?? ""} agent=${conn.activeAgent ?? conn.lastAgent ?? ""} model=${String(body.model ?? conn.lastModelID ?? "")} input_hash=${hashForLog(body.input)} input_type=${String(inputSummary.input_type)} input_messages=${String(inputSummary.input_messages)} input_chars=${String(inputSummary.input_chars)} instructions_chars=${stringLengthForLog(body.instructions)} tools_count=${toolCountForLog(body.tools)} prompt_cache_key=${String(body.prompt_cache_key ?? "")} developer_prompt_hash=${developerPromptHash ?? ""} developer_prompt_stable=${developerPromptStable} previous_response_id=${String(body.previous_response_id ?? "")}`,
+  )
+  if (inputMessages && developerPromptStable !== "true") {
+    wsLog(`[kv-debug] request-messages conn=${conn.id} ${inputMessages}`)
+  }
+}
+
+function logFrameForDebug(conn: PooledConnection, frame: Record<string, unknown>, responseID: string | undefined) {
+  const eventType = typeof frame.type === "string" ? frame.type : "message"
+  if (!eventType.startsWith("response.")) return
+  if (
+    ![
+      "response.completed",
+      "response.failed",
+      "response.incomplete",
+      "response.cancelled",
+    ].includes(eventType)
+  ) {
+    return
+  }
+  const usage = usageForLog(frame)
+  const usageText = usage ? ` usage=${JSON.stringify(usage)}` : ""
+  wsLog(
+    `[kv-debug] frame conn=${conn.id} type=${eventType} response_id=${responseID ?? ""} session=${conn.activeSessionID ?? conn.lastSessionID ?? ""} model=${conn.lastModelID ?? conn.serverModel ?? ""}${usageText}`,
+  )
 }
 
 function scopeKey(wsUrl: string, headers: Record<string, string>): string {
@@ -548,6 +722,9 @@ function isStaleResponseFrame(pending: PendingRequest, responseID: string | unde
 }
 
 function handlePreviousResponseNotFound(conn: PooledConnection, pending: PendingRequest): boolean {
+  wsLog(
+    `[kv-debug] previous_response_not_found conn=${conn.id} previous_response_id=${String(pending.body.previous_response_id ?? conn.lastResponseID ?? "")}`,
+  )
   clearLastResponseID(conn)
   pending.metadata.responseId = undefined
   if (pending.previousResponseNotFoundRetried) {
@@ -585,6 +762,7 @@ function enqueueSSE(conn: PooledConnection, frame: Record<string, unknown>) {
   const responseID = frameResponseID(frame)
   const eventType = typeof frame.type === "string" ? frame.type : "message"
   if (eventType !== "response.created" && isStaleResponseFrame(pending, responseID)) return
+  logFrameForDebug(conn, frame, responseID)
   pending.writeCommitted = true
   pending.framesReceived = true
   cacheResponseMetadata(conn, pending, responseID)
@@ -643,6 +821,7 @@ export function sendPending(conn: PooledConnection): boolean {
   try {
     const body = { ...pending.body }
     if (body.previous_response_id === undefined && conn.lastResponseID) body.previous_response_id = conn.lastResponseID
+    logRequestForDebug(conn, body)
     const payload = JSON.stringify({ ...body, type: "response.create" })
     pending.sent = true
     ws.send(payload, (error?: Error) => {

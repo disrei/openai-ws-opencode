@@ -1,4 +1,5 @@
 export const PROVIDER_ID = "openai-ws"
+export const CUSTOM_PROVIDER_ID = "custom-ws"
 
 export const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 export const ISSUER = "https://auth.openai.com"
@@ -15,6 +16,15 @@ export const CODEX_ORIGINATOR = "opencode"
 export const USER_AGENT = "openai-ws-opencode/0.1.24"
 export const CODEX_OAUTH_SCOPE = "openid profile email offline_access"
 export const OAUTH_PORT = 1455
+
+export interface CustomProviderConfig {
+  name: string
+  api: string
+  ws: string
+  npm?: string
+  models?: Record<string, unknown>
+  headers?: Record<string, string>
+}
 
 export const X_CODEX_TURN_STATE_HEADER = "x-codex-turn-state"
 export const X_CODEX_WINDOW_ID_HEADER = "x-codex-window-id"

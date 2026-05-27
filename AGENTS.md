@@ -85,6 +85,32 @@ Done means typechecking passes, tests pass, the build passes, setup remains idem
 - Do not change OAuth ports, originator headers, beta headers, or Codex endpoint constants without tests that cover the exact header/URL behavior.
 - Do not store ChatGPT OAuth artifacts, account IDs, or captured upstream payloads in the repo.
 
+## Custom Provider Support
+
+The plugin supports using a custom OpenAI-compatible WebSocket endpoint. Configure it in `opencode.json`:
+
+```jsonc
+{
+  "provider": {
+    "openai-ws": {
+      "api": "https://your-proxy.com/v1",
+      "options": {
+        "ws": "wss://your-proxy.com/v1/responses"
+      },
+      "models": { ... }
+    }
+  }
+}
+```
+
+Or use the setup CLI:
+
+```sh
+openai-ws-opencode setup --ws-url wss://your-proxy.com/v1/responses --api-url https://your-proxy.com/v1
+```
+
+The plugin reads `provider.openai-ws.options.ws` for the WebSocket URL and `provider.openai-ws.api` for the HTTP API base URL. When these are set, the plugin uses the custom endpoint instead of the hardcoded OpenAI URLs.
+
 ## Commands
 
 - Install: `bun install`

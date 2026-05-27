@@ -1,5 +1,8 @@
 import type { Hooks, Plugin } from "@opencode-ai/plugin"
 import crypto from "node:crypto"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
 import {
   CODEX_API_BASE,
   CODEX_API_ENDPOINT,
@@ -8,7 +11,10 @@ import {
   INTERNAL_PREFIX_HASH_HEADER,
   INTERNAL_SESSION_HEADER,
   OPENAI_API_BASE,
+  OPENAI_WS_URL,
   PROVIDER_ID,
+  CUSTOM_PROVIDER_ID,
+  type CustomProviderConfig,
 } from "./constants.js"
 import { oauthMethods } from "./auth/oauth.js"
 import { extractAccountId, refreshAccessToken, tokenExpiry, type StoredOAuthAuth } from "./auth/tokens.js"
@@ -18,7 +24,14 @@ import { resolveModelsForApiKey, resolveModelsForOAuth } from "./models/resolve.
 import { prepareHttpFallbackBody } from "./transport/body.js"
 import { bridgeWebSocket } from "./transport/bridge.js"
 import { closeConnections, ensureWarmConnection, invalidateStaleAuthConnections } from "./transport/pool.js"
-import { extractTransportContext, httpAuthHeaders, transportIdentity } from "./transport/headers.js"
+import { extractTransportContext, httpAuthHeaders, transportIdentity, customProviderTransportIdentity } from "./transport/headers.js"
+
+const LOG_FILE = path.join(os.tmpdir(), "openai-ws-opencode.log")
+function wsLog(msg: string) {
+  try {
+    fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`)
+  } catch {}
+}
 
 type ApiAuth = { type: "api"; key?: string }
 type OAuthAuth = StoredOAuthAuth
@@ -67,18 +80,40 @@ async function resolveOAuthAuth(auth: OAuthAuth, client: any): Promise<{ accessT
   return { accessToken: tokens.access_token, accountId }
 }
 
-function shouldBridge(url: URL, init?: RequestInit): boolean {
-  return (
-    init?.method?.toUpperCase() === "POST" &&
-    (url.pathname.includes("/v1/responses") || url.pathname.includes("/backend-api/codex/responses")) &&
-    typeof init.body === "string"
-  )
+function shouldBridge(url: URL, init?: RequestInit, customWsUrl?: string): boolean {
+  if (init?.method?.toUpperCase() !== "POST" || typeof init.body !== "string") return false
+  if (customWsUrl) return true
+  return url.pathname.includes("/v1/responses") || url.pathname.includes("/backend-api/codex/responses")
+}
+
+function extractCustomWsConfig(provider: any): CustomProviderConfig | undefined {
+  if (!provider?.options) return undefined
+  const ws = provider.options.ws
+  if (typeof ws !== "string" || !ws) return undefined
+  wsLog(`[openai-ws] Custom WebSocket URL detected: ${ws}`)
+  return {
+    name: provider.name ?? "Custom WebSocket",
+    api: provider.api ?? OPENAI_API_BASE,
+    ws,
+    npm: provider.npm ?? "@ai-sdk/openai",
+    models: provider.models,
+    headers: typeof provider.options.wsHeaders === "object" ? provider.options.wsHeaders : undefined,
+  }
+}
+
+function extractApiKeyFromOptions(provider: any): string | undefined {
+  if (!provider?.options) return undefined
+  const key = provider.options.apiKey
+  if (typeof key === "string" && key) return key
+  return undefined
 }
 
 const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
+  wsLog("=== Plugin initialized ===")
+  console.error("[openai-ws] Plugin initialized!")
   const hooks: Hooks = {
     "chat.headers": async (input, output) => {
-      if (input.model.providerID !== PROVIDER_ID) return
+      if (input.model.providerID !== CUSTOM_PROVIDER_ID) return
       const headers = (output.headers ??= {})
       headers[INTERNAL_SESSION_HEADER] = input.sessionID
       headers[INTERNAL_AGENT_HEADER] = input.agent
@@ -87,7 +122,7 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
     },
 
     "chat.params": async (input, _output) => {
-      if (input.model.providerID !== PROVIDER_ID) return
+      if (input.model.providerID !== CUSTOM_PROVIDER_ID) return
       const model = input.model as { limit?: { context?: number; input?: number; output?: number } }
       const bundledLimit = bundledLimitFor(input.model.id ?? (input.model as any).modelID)
       const current = model.limit ?? {}
@@ -118,26 +153,37 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
     },
 
     auth: {
-      provider: PROVIDER_ID,
+      provider: CUSTOM_PROVIDER_ID,
       async loader(getAuth, provider) {
+        wsLog("=== auth.loader called ===")
         const auth = (await getAuth()) as OpenAIWSAuth
+        const customWs = extractCustomWsConfig(provider)
+        const configApiKey = extractApiKeyFromOptions(provider)
 
         if (auth?.type === "api" && auth.key) {
           const apiKey = auth.key
-          if (provider) {
-            const allowedIds = await fetchOpenAIModelIds({ apiKey })
-            provider.models = resolveModelsForApiKey(allowedIds, provider.models as any) as any
+          const baseURL = customWs?.api ?? OPENAI_API_BASE
+
+          if (!customWs && provider) {
+            try {
+              const allowedIds = await fetchOpenAIModelIds({ apiKey })
+              provider.models = resolveModelsForApiKey(allowedIds, provider.models as any) as any
+            } catch {}
           }
-          const identity = transportIdentity({ type: "api", apiKey })
+
+          const identity = customWs
+            ? customProviderTransportIdentity(customWs, apiKey)
+            : transportIdentity({ type: "api", apiKey })
           invalidateStaleAuthConnections(identity.wsUrl, identity.wsHeaders)
           ensureWarmConnection(identity.wsUrl, identity.wsHeaders)
           return {
             apiKey,
-            baseURL: OPENAI_API_BASE,
+            baseURL,
             async fetch(input: RequestInfo | URL, init?: RequestInit) {
+              wsLog("=== custom auth fetch called ===")
               const url = typeof input === "string" ? new URL(input) : input instanceof URL ? input : new URL(input.url)
               const context = extractTransportContext(init?.headers)
-              if (shouldBridge(url, init)) {
+              if (shouldBridge(url, init, customWs?.ws)) {
                 try {
                   const body = JSON.parse(init?.body as string) as Record<string, unknown>
                   if (body.stream !== false) {
@@ -166,7 +212,61 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
           }
         }
 
-        if (auth?.type === "oauth") {
+        if (configApiKey) {
+          const apiKey = configApiKey
+          const baseURL = customWs?.api ?? OPENAI_API_BASE
+
+          if (!customWs && provider) {
+            try {
+              const allowedIds = await fetchOpenAIModelIds({ apiKey })
+              provider.models = resolveModelsForApiKey(allowedIds, provider.models as any) as any
+            } catch {}
+          }
+
+          const identity = customWs
+            ? customProviderTransportIdentity(customWs, apiKey)
+            : transportIdentity({ type: "api", apiKey })
+          wsLog(`[openai-ws] Auth from config. WebSocket URL: ${identity.wsUrl}, API Base: ${baseURL}`)
+          invalidateStaleAuthConnections(identity.wsUrl, identity.wsHeaders)
+          ensureWarmConnection(identity.wsUrl, identity.wsHeaders)
+          return {
+            apiKey,
+            baseURL,
+            async fetch(input: RequestInfo | URL, init?: RequestInit) {
+              const url = typeof input === "string" ? new URL(input) : input instanceof URL ? input : new URL(input.url)
+              const context = extractTransportContext(init?.headers)
+              if (shouldBridge(url, init, customWs?.ws)) {
+                try {
+                  const body = JSON.parse(init?.body as string) as Record<string, unknown>
+                  if (body.stream !== false) {
+                    wsLog(`[openai-ws] >>> Using WebSocket for streaming: ${identity.wsUrl}`)
+                    return bridgeWebSocket(identity.wsUrl, identity.wsHeaders, body, false, context, init?.signal ?? undefined, (fallbackSignal) =>
+                      globalThis.fetch(input, {
+                        ...init,
+                        signal: fallbackSignal,
+                        body: JSON.stringify(prepareHttpFallbackBody(body, false)),
+                        headers: httpAuthHeaders(context.forwardHeaders, { type: "api", apiKey }),
+                      }),
+                    )
+                  }
+                } catch {}
+              }
+
+              wsLog(`[openai-ws] >>> Using HTTP fallback for non-streaming request`)
+              if (init?.method?.toUpperCase() === "POST" && typeof init.body === "string") {
+                try {
+                  init = { ...init, body: JSON.stringify(prepareHttpFallbackBody(JSON.parse(init.body), false)) }
+                } catch {}
+              }
+              return globalThis.fetch(input, {
+                ...init,
+                headers: httpAuthHeaders(context.forwardHeaders, { type: "api", apiKey }),
+              })
+            },
+          }
+        }
+
+        if (!customWs && auth?.type === "oauth") {
           const initialAuth = await resolveOAuthAuth(auth, client)
           if (provider) {
             const catalog = await fetchCodexCatalog({ accessToken: initialAuth.accessToken, accountId: initialAuth.accountId })
@@ -218,7 +318,14 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
           }
         }
 
-        throw new Error("OpenAI WebSocket auth is missing; run `opencode auth login openai-ws`.")
+        const baseURL = customWs?.api ?? OPENAI_API_BASE
+        return {
+          apiKey: "",
+          baseURL,
+          async fetch(input: RequestInfo | URL, init?: RequestInit) {
+            throw new Error("OpenAI WebSocket auth is missing; run `opencode auth login openai-ws`.")
+          },
+        }
       },
       methods: oauthMethods,
     },
@@ -228,3 +335,4 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
 }
 
 export default OpenAIWebSocketPlugin
+

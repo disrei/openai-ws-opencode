@@ -8,6 +8,7 @@ import {
   OPENAI_WS_BETA,
   OPENAI_WS_URL,
   USER_AGENT,
+  type CustomProviderConfig,
 } from "../constants.js"
 
 export type TransportContext = {
@@ -94,4 +95,25 @@ export function extractTransportContext(input?: HeadersInit): TransportContext &
   forwardHeaders.delete(INTERNAL_PREFIX_HASH_HEADER)
 
   return { sessionID, agent, modelID, stablePrefixHash, forwardHeaders }
+}
+
+export function customProviderWebSocketHeaders(apiKey: string, customHeaders?: Record<string, string>): Record<string, string> {
+  return {
+    ...defaultHeaders(),
+    ...organizationProjectHeaders(),
+    Authorization: `Bearer ${apiKey}`,
+    ...customHeaders,
+  }
+}
+
+export function customProviderTransportIdentity(config: CustomProviderConfig, apiKey: string): {
+  isOAuth: boolean
+  wsUrl: string
+  wsHeaders: Record<string, string>
+} {
+  return {
+    isOAuth: false,
+    wsUrl: config.ws,
+    wsHeaders: customProviderWebSocketHeaders(apiKey, config.headers),
+  }
 }

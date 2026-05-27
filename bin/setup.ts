@@ -22,6 +22,8 @@ export interface SetupOptions {
   cacheRepair?: boolean
   catalog?: CodexModelInfo[]
   catalogFetch?: () => Promise<CodexModelInfo[] | undefined>
+  wsUrl?: string
+  apiUrl?: string
 }
 
 interface CacheRepairOptions {
@@ -71,7 +73,7 @@ function pluginPackageName(specifier: string): string {
   return lastAt > 0 ? specifier.slice(0, lastAt) : specifier
 }
 
-export function patchConfigText(input: string, pluginSpec = DEFAULT_PLUGIN_SPEC, replacePluginSpec = false, catalog?: CodexModelInfo[]): string {
+export function patchConfigText(input: string, pluginSpec = DEFAULT_PLUGIN_SPEC, replacePluginSpec = false, catalog?: CodexModelInfo[], wsUrl?: string, apiUrl?: string): string {
   let text = input.trim() ? input : "{}"
   const config = (parse(text) ?? {}) as Record<string, any>
 
@@ -89,7 +91,14 @@ export function patchConfigText(input: string, pluginSpec = DEFAULT_PLUGIN_SPEC,
 
   const next = (parse(text) ?? {}) as Record<string, any>
   const existingModels = next.provider?.["openai-ws"]?.models ?? {}
-  text = applyJsonPatch(text, ["provider", "openai-ws"], providerConfig(existingModels, catalog))
+  const providerCfg = providerConfig(existingModels, catalog)
+  if (wsUrl) {
+    providerCfg.options = { ...providerCfg.options, ws: wsUrl }
+  }
+  if (apiUrl) {
+    providerCfg.api = apiUrl
+  }
+  text = applyJsonPatch(text, ["provider", "openai-ws"], providerCfg)
 
   return applyEdits(
     text,
@@ -282,7 +291,7 @@ export async function setupOpenCodeConfig(options: SetupOptions = {}): Promise<s
   }
 
   const catalog = options.catalog ?? (await resolveLiveCatalog(options.catalogFetch))
-  const updated = patchConfigText(existing, options.pluginSpec ?? DEFAULT_PLUGIN_SPEC, Boolean(options.pluginSpec), catalog)
+  const updated = patchConfigText(existing, options.pluginSpec ?? DEFAULT_PLUGIN_SPEC, Boolean(options.pluginSpec), catalog, options.wsUrl, options.apiUrl)
   await fs.mkdir(path.dirname(file), { recursive: true })
   await fs.writeFile(file, updated.endsWith("\n") ? updated : `${updated}\n`, "utf8")
   if (options.cacheRepair !== false) {
@@ -305,8 +314,10 @@ export function parseArgs(argv: string[]): SetupOptions {
     else if (arg === "--path") options.configPath = argv[++index]
     else if (arg === "--plugin") options.pluginSpec = argv[++index]
     else if (arg === "--no-cache-repair") options.cacheRepair = false
+    else if (arg === "--ws-url") options.wsUrl = argv[++index]
+    else if (arg === "--api-url") options.apiUrl = argv[++index]
     else if (arg === "--help" || arg === "-h") {
-      console.log("Usage: openai-ws-opencode setup [--global|--project] [--path <opencode.json>] [--plugin <specifier>] [--no-cache-repair]")
+      console.log("Usage: openai-ws-opencode setup [--global|--project] [--path <opencode.json>] [--plugin <specifier>] [--no-cache-repair] [--ws-url <websocket-url>] [--api-url <api-url>]")
       process.exit(0)
     }
   }

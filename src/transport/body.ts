@@ -6,6 +6,16 @@ import {
   X_OPENAI_SUBAGENT_HEADER,
 } from "../constants.js"
 import type { TransportContext } from "./headers.js"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
+
+const LOG_FILE = path.join(os.tmpdir(), "openai-ws-opencode.log")
+function wsLog(msg: string) {
+  try {
+    fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`)
+  } catch {}
+}
 
 function mergeClientMetadata(requestBody: Record<string, unknown>, context: TransportContext): Record<string, string> | undefined {
   const existing = requestBody.client_metadata
@@ -74,8 +84,10 @@ export function prepareBody(
   if (wsBody.store === undefined) wsBody.store = false
   if (wsBody.stream === undefined) wsBody.stream = true
   if (wsBody.background === undefined && shouldUseBackgroundResponses()) wsBody.background = true
+  delete wsBody.max_output_tokens
+  delete wsBody.max_response_output_tokens
+  wsLog(`prepareBody keys=${Object.keys(wsBody).sort().join(",")}`)
   if (isOAuth) {
-    delete wsBody.max_output_tokens
     delete wsBody.max_tokens
   }
   if (wsBody.prompt_cache_key === undefined && context.stablePrefixHash) wsBody.prompt_cache_key = context.stablePrefixHash

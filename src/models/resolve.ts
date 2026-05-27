@@ -286,5 +286,6 @@ export function providerConfig(overrides: ProviderModelOverrides = {}, catalog?:
     name: "OpenAI WebSocket",
     npm: "@ai-sdk/openai",
     models: providerConfigModels(overrides as Record<string, unknown>, catalog),
+    options: {} as Record<string, unknown>,
   }
 }

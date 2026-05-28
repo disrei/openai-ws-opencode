@@ -43,7 +43,7 @@
     "live:test": "bun scripts/live-opencode.ts",
     "hooks:install": "bun scripts/install-hooks.ts",
     "prepare": "bun scripts/install-hooks.ts",
-    "build": "tsc -p tsconfig.build.json && bun build ./bin/setup.ts --target=node --format=esm --outfile=bin/setup.js --external=jsonc-parser",
+    "build": "tsc -p tsconfig.build.json && bun build ./bin/setup.ts --target=node --format=esm --outfile=bin/setup.js --external=jsonc-parser && bun ./scripts/normalize-setup-shebang.ts",
     "prepack": "bun run build",
     "prepublishOnly": "bun run lint && bun run typecheck && bun test && bun run build"
   },

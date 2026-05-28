@@ -36,6 +36,28 @@ function wsLog(msg: string) {
   } catch {}
 }
 
+const providerModelRefreshVersion = new WeakMap<object, number>()
+
+function nextProviderModelRefreshVersion(provider: object): number {
+  const version = (providerModelRefreshVersion.get(provider) ?? 0) + 1
+  providerModelRefreshVersion.set(provider, version)
+  return version
+}
+
+function refreshProviderModelsInBackground(
+  provider: any,
+  load: () => Promise<Record<string, unknown> | undefined>,
+): void {
+  if (!provider || typeof provider !== "object") return
+  const version = nextProviderModelRefreshVersion(provider)
+  void (async () => {
+    try {
+      const models = await load()
+      if (models && providerModelRefreshVersion.get(provider) === version) provider.models = models as any
+    } catch {}
+  })()
+}
+
 type ApiAuth = { type: "api"; key?: string }
 type OAuthAuth = StoredOAuthAuth
 type OpenAIWSAuth = ApiAuth | OAuthAuth | undefined
@@ -77,6 +99,11 @@ async function resolveOAuthAuth(auth: OAuthAuth, client: any): Promise<{ accessT
     },
   })
   return { accessToken: tokens.access_token, accountId }
+}
+
+function hasFreshOAuthAccess(auth: OAuthAuth): auth is OAuthAuth & { access: string; expires: number } {
+  const expiryBufferMs = 5 * 60 * 1000
+  return typeof auth.access === "string" && auth.access.length > 0 && typeof auth.expires === "number" && auth.expires > Date.now() + expiryBufferMs
 }
 
 function shouldBridge(url: URL, init?: RequestInit, customWsUrl?: string): boolean {
@@ -163,10 +190,10 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
           const baseURL = customWs?.api ?? OPENAI_API_BASE
 
           if (!customWs && provider) {
-            try {
+            refreshProviderModelsInBackground(provider, async () => {
               const allowedIds = await fetchOpenAIModelIds({ apiKey })
-              provider.models = resolveModelsForApiKey(allowedIds, provider.models as any) as any
-            } catch {}
+              return resolveModelsForApiKey(allowedIds, provider.models as any) as Record<string, unknown>
+            })
           }
 
           const identity = customWs
@@ -215,10 +242,10 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
           const baseURL = customWs?.api ?? OPENAI_API_BASE
 
           if (!customWs && provider) {
-            try {
+            refreshProviderModelsInBackground(provider, async () => {
               const allowedIds = await fetchOpenAIModelIds({ apiKey })
-              provider.models = resolveModelsForApiKey(allowedIds, provider.models as any) as any
-            } catch {}
+              return resolveModelsForApiKey(allowedIds, provider.models as any) as Record<string, unknown>
+            })
           }
 
           const identity = customWs
@@ -265,16 +292,20 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
         }
 
         if (!customWs && auth?.type === "oauth") {
-          const initialAuth = await resolveOAuthAuth(auth, client)
           if (provider) {
-            const catalog = await fetchCodexCatalog({ accessToken: initialAuth.accessToken, accountId: initialAuth.accountId })
-            provider.models = resolveModelsForOAuth(catalog, provider.models as any) as any
+            refreshProviderModelsInBackground(provider, async () => {
+              const currentAuth = await resolveOAuthAuth(auth, client)
+              const catalog = await fetchCodexCatalog({ accessToken: currentAuth.accessToken, accountId: currentAuth.accountId })
+              return resolveModelsForOAuth(catalog, provider.models as any) as Record<string, unknown>
+            })
           }
-          const initialIdentity = transportIdentity({ type: "oauth", accessToken: initialAuth.accessToken, accountId: initialAuth.accountId })
-          invalidateStaleAuthConnections(initialIdentity.wsUrl, initialIdentity.wsHeaders)
-          ensureWarmConnection(initialIdentity.wsUrl, initialIdentity.wsHeaders)
+          if (hasFreshOAuthAccess(auth)) {
+            const initialIdentity = transportIdentity({ type: "oauth", accessToken: auth.access, accountId: auth.accountId })
+            invalidateStaleAuthConnections(initialIdentity.wsUrl, initialIdentity.wsHeaders)
+            ensureWarmConnection(initialIdentity.wsUrl, initialIdentity.wsHeaders)
+          }
           return {
-            apiKey: initialAuth.accessToken,
+            apiKey: auth.access ?? "",
             baseURL: CODEX_API_BASE,
             async fetch(input: RequestInfo | URL, init?: RequestInit) {
               const currentAuth = (await getAuth()) as OAuthAuth | undefined

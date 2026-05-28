@@ -22,7 +22,12 @@ import type { TransportContext } from "./headers.js"
 let WebSocketImpl: WebSocketConstructor = loadDefaultWebSocketConstructor()
 const LOG_FILE = path.join(os.tmpdir(), "openai-ws-opencode.log")
 
+function verboseLogEnabled() {
+  return process.env.OPENAI_WS_OPENCODE_VERBOSE_LOG === "1"
+}
+
 function wsLog(msg: string) {
+  if (!verboseLogEnabled()) return
   try {
     fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`)
   } catch {}

@@ -7,6 +7,4 @@ coverage/
 .env
 .env.*
 .cu*
-.kanban/board.json
-.kanban/settings.json
-.kanban/sessions/2026-05-27/mpo62ay0-j9zyv8y.json
+.kanban/

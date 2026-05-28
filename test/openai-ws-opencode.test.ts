@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url"
 import { describe, expect, test, afterEach, vi } from "vitest"
 import WebSocket, { WebSocketServer } from "ws"
 import plugin from "../src/index.js"
+import { normalizeSetupShebang } from "../scripts/normalize-setup-shebang.ts"
 import { createBrowserAuthorization } from "../src/auth/oauth.js"
 import { loadDefaultWebSocketConstructor } from "../src/transport/bun-websocket.js"
 import { transportConfig } from "../src/transport/config.js"
@@ -873,6 +874,10 @@ describe("body and headers", () => {
     expect(first.headers[INTERNAL_PREFIX_HASH_HEADER]).toBeUndefined()
     expect(second.headers[INTERNAL_PREFIX_HASH_HEADER]).toBeUndefined()
   })
+
+  test("normalizes setup shebang to a single header", () => {
+    expect(normalizeSetupShebang("#!/usr/bin/env node\n#!/usr/bin/env node\n\nconsole.log('x')\n")).toBe("#!/usr/bin/env node\nconsole.log('x')\n")
+  })
 })
 
 describe("models", () => {
@@ -1114,6 +1119,9 @@ describe("plugin auth loader", () => {
     const hooks = await plugin({ client: { auth: { set: vi.fn() } } } as any)
     const provider = { models: {} }
     const loaded = await hooks.auth?.loader?.(async () => ({ type: "api", key: "api-key-test" }) as any, provider as any)
+    await vi.waitFor(() => {
+      expect((provider.models as any)["gpt-5.88"]).toBeDefined()
+    })
     const modelID = Object.keys(provider.models)[0]
     expect((provider.models as any)[modelID].providerID).toBe("openai-ws")
     expect((provider.models as any)["gpt-5.88"]).toBeDefined()
@@ -1137,6 +1145,95 @@ describe("plugin auth loader", () => {
     expect(ws.options.headers).not.toHaveProperty("ChatGPT-Account-Id")
     ws.open()
     expect(JSON.parse(ws.sent[0])).toMatchObject({ type: "response.create", model: modelID })
+  })
+
+  test("does not block auth loader on API model discovery", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    let releaseFetch: (() => void) | undefined
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          releaseFetch = () => resolve(new Response(JSON.stringify({ data: [{ id: "gpt-5.4-mini" }] }), { status: 200 }))
+        }) as Promise<Response>,
+    )
+
+    const hooks = await plugin({ client: { auth: { set: vi.fn() } } } as any)
+    const provider = { models: {} }
+    const loaderPromise = hooks.auth?.loader?.(async () => ({ type: "api", key: "api-key-test" }) as any, provider as any)
+
+    await expect(Promise.race([loaderPromise, Promise.resolve("ready")])).resolves.toBe("ready")
+
+    releaseFetch?.()
+    await loaderPromise
+  })
+
+  test("keeps the latest background API model refresh result", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    let releaseOld: (() => void) | undefined
+    let releaseNew: (() => void) | undefined
+    vi.spyOn(globalThis, "fetch").mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      const authHeader = new Headers(init?.headers).get("Authorization")
+      if (url.includes("/v1/models") && authHeader === "Bearer old-key") {
+        return new Promise((resolve) => {
+          releaseOld = () => resolve(new Response(JSON.stringify({ data: [{ id: "gpt-5.4" }] }), { status: 200 }))
+        }) as Promise<Response>
+      }
+      if (url.includes("/v1/models") && authHeader === "Bearer new-key") {
+        return new Promise((resolve) => {
+          releaseNew = () => resolve(new Response(JSON.stringify({ data: [{ id: "gpt-5.5" }] }), { status: 200 }))
+        }) as Promise<Response>
+      }
+      return Promise.resolve(new Response("unexpected", { status: 500 }))
+    })
+
+    const hooks = await plugin({ client: { auth: { set: vi.fn() } } } as any)
+    const provider = { models: {} }
+
+    await hooks.auth?.loader?.(async () => ({ type: "api", key: "old-key" }) as any, provider as any)
+    await hooks.auth?.loader?.(async () => ({ type: "api", key: "new-key" }) as any, provider as any)
+
+    releaseNew?.()
+    await vi.waitFor(() => {
+      expect((provider.models as any)["gpt-5.5"]).toBeDefined()
+    })
+
+    releaseOld?.()
+    await Promise.resolve()
+
+    expect((provider.models as any)["gpt-5.5"]).toBeDefined()
+    expect((provider.models as any)["gpt-5.4"]).toBeUndefined()
+  })
+
+  test("does not block auth loader on expired OAuth refresh", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    let releaseRefresh: (() => void) | undefined
+    vi.spyOn(globalThis, "fetch").mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes("/oauth/token")) {
+        return new Promise((resolve) => {
+          releaseRefresh = () =>
+            resolve(
+              new Response(JSON.stringify({ access_token: "fresh-access", refresh_token: "refresh-new", expires_in: 3600 }), { status: 200 }),
+            )
+        }) as Promise<Response>
+      }
+      if (url.includes("/backend-api/codex/models")) return Promise.resolve(new Response(JSON.stringify({ models: [] }), { status: 200 }))
+      return Promise.resolve(new Response("unexpected", { status: 500 }))
+    })
+
+    const hooks = await plugin({ client: { auth: { set: vi.fn() } } } as any)
+    const provider = { models: {} }
+    const loaderPromise = hooks.auth?.loader?.(
+      async () => ({ type: "oauth", refresh: "refresh-old", access: "stale-access", expires: Date.now() - 1, accountId: "acct_1" }) as any,
+      provider as any,
+    )
+
+    await expect(Promise.race([loaderPromise, Promise.resolve("ready")])).resolves.toBe("ready")
+    expect(MockWebSocket.instances).toHaveLength(0)
+
+    releaseRefresh?.()
+    await loaderPromise
   })
 
   test("refreshes OAuth auth inside fetch instead of freezing loader token", async () => {
@@ -1258,7 +1355,7 @@ describe("plugin auth loader", () => {
       body: JSON.stringify({ model: "gpt-5.4-mini", input: "hi", stream: false }),
     })
 
-    const fallbackCall = (globalThis.fetch as any).mock.calls.at(-1) as [URL, RequestInit]
+    const fallbackCall = (globalThis.fetch as any).mock.calls.find(([input]: [URL | string]) => String(input) === CODEX_API_ENDPOINT) as [URL, RequestInit]
     const headers = new Headers(fallbackCall[1].headers)
     expect(fallbackCall[0].toString()).toBe(CODEX_API_ENDPOINT)
     expect(JSON.parse(String(fallbackCall[1].body))).toMatchObject({ stream: false, store: false })

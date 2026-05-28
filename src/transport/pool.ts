@@ -6,6 +6,7 @@ import {
   CODEX_WS_URL,
   OPENAI_MODEL_HEADER,
   OPENAI_WS_INSTALLATION_ID_ENV,
+  RESPONSE_ID_CACHE_PATH_ENV,
   RESPONSE_PROCESSED_DISABLE_ENV,
   RESPONSE_PROCESSED_ENV,
   X_CODEX_INSTALLATION_ID_HEADER,
@@ -15,23 +16,14 @@ import {
   X_OPENAI_SUBAGENT_HEADER,
   X_REASONING_INCLUDED_HEADER,
 } from "../constants.js"
+import { wsLog } from "../log.js"
 import { loadDefaultWebSocketConstructor, type WebSocketConstructor, type WebSocketLike } from "./bun-websocket.js"
 import { transportConfig } from "./config.js"
 import type { TransportContext } from "./headers.js"
 
 let WebSocketImpl: WebSocketConstructor = loadDefaultWebSocketConstructor()
-const LOG_FILE = path.join(os.tmpdir(), "openai-ws-opencode.log")
-
-function verboseLogEnabled() {
-  return process.env.OPENAI_WS_OPENCODE_VERBOSE_LOG === "1"
-}
-
-function wsLog(msg: string) {
-  if (!verboseLogEnabled()) return
-  try {
-    fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`)
-  } catch {}
-}
+const RESPONSE_ID_CACHE_FILE = "response-ids.json"
+const MAX_PERSISTED_RESPONSE_IDS = 10
 
 type PendingMetadata = {
   responseId?: string
@@ -118,7 +110,10 @@ type QueueEntry = {
 const acquisitionQueues = new Map<string, QueueEntry[]>()
 const turnStateByContext = new Map<string, string>()
 const lastResponseIDByContext = new Map<string, string>()
+const lastResponseIDUpdatedAtByContext = new Map<string, number>()
 const lastDeveloperPromptHashByContext = new Map<string, string>()
+let persistedResponseIDsLoaded = false
+let persistedResponseIDCachePath: string | undefined
 let nextConnectionID = 1
 
 export const readyState = {
@@ -145,6 +140,96 @@ function authScopeHash(headers: Record<string, string>): string {
     .map(([key, value]) => `${key}:${value}`)
     .join("\n")
   return crypto.createHash("sha256").update(auth).digest("hex")
+}
+
+function responseIDCachePath(): string {
+  const override = process.env[RESPONSE_ID_CACHE_PATH_ENV]
+  if (override) return override
+  if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA ?? process.env.APPDATA
+    if (localAppData) return path.join(localAppData, "openai-ws-opencode", RESPONSE_ID_CACHE_FILE)
+  }
+  if (process.env.XDG_CACHE_HOME) return path.join(process.env.XDG_CACHE_HOME, "openai-ws-opencode", RESPONSE_ID_CACHE_FILE)
+  return path.join(os.homedir(), ".cache", "openai-ws-opencode", RESPONSE_ID_CACHE_FILE)
+}
+
+function resetPersistedResponseIDState() {
+  lastResponseIDByContext.clear()
+  lastResponseIDUpdatedAtByContext.clear()
+  persistedResponseIDsLoaded = false
+  persistedResponseIDCachePath = undefined
+}
+
+function loadPersistedResponseIDs() {
+  const filePath = responseIDCachePath()
+  if (persistedResponseIDsLoaded && persistedResponseIDCachePath === filePath) return
+  lastResponseIDByContext.clear()
+  persistedResponseIDsLoaded = true
+  persistedResponseIDCachePath = filePath
+  try {
+    const raw = fs.readFileSync(filePath, "utf8")
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return
+    for (const [key, value] of Object.entries(parsed)) {
+      if (typeof value === "string" && value) {
+        lastResponseIDByContext.set(key, value)
+        lastResponseIDUpdatedAtByContext.set(key, 0)
+        continue
+      }
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue
+      const entry = value as { response_id?: unknown; updated_at?: unknown }
+      if (typeof entry.response_id !== "string" || !entry.response_id) continue
+      lastResponseIDByContext.set(key, entry.response_id)
+      lastResponseIDUpdatedAtByContext.set(key, typeof entry.updated_at === "number" && Number.isFinite(entry.updated_at) ? entry.updated_at : 0)
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return
+    wsLog(`[kv-debug] failed to load response id cache path=${filePath} error=${messageFromError(error) ?? "unknown"}`)
+  }
+}
+
+function trimPersistedResponseIDState() {
+  if (lastResponseIDByContext.size <= MAX_PERSISTED_RESPONSE_IDS) return
+  const keep = [...lastResponseIDByContext.entries()]
+    .map(([key, responseID]) => ({
+      key,
+      responseID,
+      updatedAt: lastResponseIDUpdatedAtByContext.get(key) ?? 0,
+    }))
+    .sort((left, right) => right.updatedAt - left.updatedAt || left.key.localeCompare(right.key))
+    .slice(0, MAX_PERSISTED_RESPONSE_IDS)
+  lastResponseIDByContext.clear()
+  lastResponseIDUpdatedAtByContext.clear()
+  for (const entry of keep) {
+    lastResponseIDByContext.set(entry.key, entry.responseID)
+    lastResponseIDUpdatedAtByContext.set(entry.key, entry.updatedAt)
+  }
+}
+
+function syncPersistedResponseIDs() {
+  loadPersistedResponseIDs()
+  trimPersistedResponseIDState()
+  const filePath = responseIDCachePath()
+  try {
+    if (lastResponseIDByContext.size === 0) {
+      fs.rmSync(filePath, { force: true })
+      return
+    }
+    fs.mkdirSync(path.dirname(filePath), { recursive: true })
+    fs.writeFileSync(
+      filePath,
+      `${JSON.stringify(
+        Object.fromEntries(
+          [...lastResponseIDByContext.entries()]
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([key, responseID]) => [key, { response_id: responseID, updated_at: lastResponseIDUpdatedAtByContext.get(key) ?? 0 }]),
+        ),
+      )}\n`,
+      "utf8",
+    )
+  } catch (error) {
+    wsLog(`[kv-debug] failed to persist response id cache path=${filePath} error=${messageFromError(error) ?? "unknown"}`)
+  }
 }
 
 function hashForLog(value: unknown): string {
@@ -693,13 +778,21 @@ function hasReplaySafeInput(body: Record<string, unknown>): boolean {
 }
 
 function clearLastResponseID(conn: PooledConnection) {
+  loadPersistedResponseIDs()
+  if (conn.lastResponseID === undefined && !lastResponseIDByContext.has(conn.contextKey)) return
   conn.lastResponseID = undefined
   lastResponseIDByContext.delete(conn.contextKey)
+  lastResponseIDUpdatedAtByContext.delete(conn.contextKey)
+  syncPersistedResponseIDs()
 }
 
 function persistLastResponseID(conn: PooledConnection, responseID: string) {
+  loadPersistedResponseIDs()
+  if (conn.lastResponseID === responseID && lastResponseIDByContext.get(conn.contextKey) === responseID) return
   conn.lastResponseID = responseID
   lastResponseIDByContext.set(conn.contextKey, responseID)
+  lastResponseIDUpdatedAtByContext.set(conn.contextKey, Date.now())
+  syncPersistedResponseIDs()
 }
 
 function frameResponseID(frame: Record<string, unknown>): string | undefined {
@@ -1043,6 +1136,7 @@ function handleSocketLoss(conn: PooledConnection) {
 function create(wsUrl: string, headers: Record<string, string>, context: TransportContext = {}, warm = false): PooledConnection {
   const hash = authScopeHash(headers)
   const key = contextScopeKey(wsUrl, headers, context)
+  loadPersistedResponseIDs()
   const conn: PooledConnection = {
     id: `ws-${nextConnectionID++}`,
     ws: null,
@@ -1240,7 +1334,15 @@ export function resetPoolForTesting() {
   }
   acquisitionQueues.clear()
   turnStateByContext.clear()
-  lastResponseIDByContext.clear()
+  resetPersistedResponseIDState()
+}
+
+export function clearPersistedResponseIDsForTesting() {
+  const filePath = responseIDCachePath()
+  resetPersistedResponseIDState()
+  try {
+    fs.rmSync(filePath, { force: true })
+  } catch {}
 }
 
 export function setWebSocketConstructorForTesting(ctor: WebSocketConstructor) {

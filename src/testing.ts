@@ -1,7 +1,9 @@
 export { oauthTesting } from "./auth/oauth.js"
+export { appendVerboseLogForTesting, clearVerboseLogForTesting, readVerboseLogForTesting } from "./log.js"
 export { prepareBody, prepareHttpFallbackBody } from "./transport/body.js"
 export { apiKeyWebSocketHeaders, oauthWebSocketHeaders, extractTransportContext, transportIdentity } from "./transport/headers.js"
 export {
+  clearPersistedResponseIDsForTesting,
   connectionPool,
   readyState,
   ensureWarmConnection,

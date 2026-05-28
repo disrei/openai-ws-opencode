@@ -87,6 +87,50 @@ This path uses the Codex/ChatGPT backend and sends:
 
 Important: the OAuth/Codex WebSocket path is unofficial, reuses Codex OAuth behavior, targets a private ChatGPT backend, can break without notice, and may carry account or terms-of-service risk. This project is not affiliated with OpenAI or OpenCode.
 
+## Cross-process continue
+
+The plugin now persists the last successful `response_id` per transport context so `opencode run` followed by `opencode run --continue` can reuse `previous_response_id` even though those commands start separate processes.
+
+- Default cache file:
+  - Windows: `%LOCALAPPDATA%\openai-ws-opencode\response-ids.json`
+  - Linux/macOS: `$XDG_CACHE_HOME/openai-ws-opencode/response-ids.json` or `~/.cache/openai-ws-opencode/response-ids.json`
+- Override the cache path with `OPENAI_WS_OPENCODE_RESPONSE_ID_CACHE_PATH`
+- If the upstream endpoint rejects a stale `previous_response_id`, the plugin clears that cached entry automatically
+
+If your upstream endpoint requires persisted Responses for continuation lookup, enable `store: true` on the agent or model you use for `run` / `--continue`:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "build": {
+      "options": {
+        "store": true
+      }
+    },
+    "title": {
+      "options": {
+        "store": true
+      }
+    }
+  }
+}
+```
+
+The plugin only defaults `store` to `false` when the request does not already specify a value, so explicit `store: true` continues to pass through unchanged.
+
+Some OpenAI-compatible proxies reject persisted Responses entirely and require `store: false`. For example, an endpoint may return `OpenAI WebSocket error 400: Store must be set to false`. In that case leave `store` disabled and rely on `previous_response_id` reuse only if that upstream still supports continuation chaining for non-stored responses.
+
+## Verbose logging
+
+Verbose logging is enabled by default. The plugin writes debug output to your system temp directory as `openai-ws-opencode.log`.
+
+- Set `OPENAI_WS_OPENCODE_VERBOSE_LOG=0` to disable verbose logging entirely
+- The log keeps only the latest 10 build-agent rounds by default
+- Override that retention with `OPENAI_WS_OPENCODE_VERBOSE_LOG_MAX_ROUNDS`
+
+Persisted `response_id` continuation state is also trimmed to the latest 10 cached contexts so the cache file does not grow without bound.
+
 ## Local development install
 
 From this repo:

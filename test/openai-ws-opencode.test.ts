@@ -1,6 +1,6 @@
 import crypto from "node:crypto"
 import { EventEmitter } from "node:events"
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
@@ -24,14 +24,20 @@ import {
   OPENAI_WS_BETA,
   OPENAI_WS_INSTALLATION_ID_ENV,
   PROVIDER_ID,
+  RESPONSE_ID_CACHE_PATH_ENV,
   RESPONSE_PROCESSED_DISABLE_ENV,
   RESPONSE_PROCESSED_ENV,
   USER_AGENT,
+  VERBOSE_LOG_ENV,
+  VERBOSE_LOG_MAX_ROUNDS_ENV,
 } from "../src/constants.js"
 import { extractAccountId, parseJwtClaims, refreshAccessToken } from "../src/auth/tokens.js"
 import {
   apiKeyWebSocketHeaders,
   bridgeWebSocket,
+  appendVerboseLogForTesting,
+  clearVerboseLogForTesting,
+  clearPersistedResponseIDsForTesting,
   connectionPool,
   invalidateStaleAuthConnections,
   oauthTesting,
@@ -44,6 +50,8 @@ import {
   fetchCodexCatalog,
   fetchOpenAIModelIds,
   ensureWarmConnection,
+  prepareHttpFallbackBody,
+  readVerboseLogForTesting,
   resolveCodexClientVersion,
   resolveModels,
   resolveModelsForApiKey,
@@ -365,15 +373,20 @@ const originalInstallationID = process.env[OPENAI_WS_INSTALLATION_ID_ENV]
 const originalBackgroundOrchestration = process.env[BACKGROUND_ORCHESTRATION_ENV]
 const originalResponseProcessed = process.env[RESPONSE_PROCESSED_ENV]
 const originalResponseProcessedDisable = process.env[RESPONSE_PROCESSED_DISABLE_ENV]
+const originalResponseIDCachePath = process.env[RESPONSE_ID_CACHE_PATH_ENV]
 const originalOpenAIOrganization = process.env.OPENAI_ORGANIZATION
 const originalOpenAIProject = process.env.OPENAI_PROJECT
+const originalVerboseLog = process.env[VERBOSE_LOG_ENV]
+const originalVerboseLogMaxRounds = process.env[VERBOSE_LOG_MAX_ROUNDS_ENV]
 const skipCatalogEnv = "OPENAI_WS_OPENCODE_SKIP_CATALOG"
 const originalSkipCatalog = process.env[skipCatalogEnv]
+let activeResponseIDCacheRoot: string | undefined
 
 afterEach(() => {
   vi.useRealTimers()
   oauthTesting.reset()
   resetPoolForTesting()
+  if (activeResponseIDCacheRoot) clearPersistedResponseIDsForTesting()
   resetCatalogCacheForTesting()
   resetWebSocketConstructorForTesting()
   MockWebSocket.instances = []
@@ -387,14 +400,29 @@ afterEach(() => {
   else process.env[RESPONSE_PROCESSED_ENV] = originalResponseProcessed
   if (originalResponseProcessedDisable === undefined) delete process.env[RESPONSE_PROCESSED_DISABLE_ENV]
   else process.env[RESPONSE_PROCESSED_DISABLE_ENV] = originalResponseProcessedDisable
+  if (originalResponseIDCachePath === undefined) delete process.env[RESPONSE_ID_CACHE_PATH_ENV]
+  else process.env[RESPONSE_ID_CACHE_PATH_ENV] = originalResponseIDCachePath
   if (originalOpenAIOrganization === undefined) delete process.env.OPENAI_ORGANIZATION
   else process.env.OPENAI_ORGANIZATION = originalOpenAIOrganization
   if (originalOpenAIProject === undefined) delete process.env.OPENAI_PROJECT
   else process.env.OPENAI_PROJECT = originalOpenAIProject
+  if (originalVerboseLog === undefined) delete process.env[VERBOSE_LOG_ENV]
+  else process.env[VERBOSE_LOG_ENV] = originalVerboseLog
+  if (originalVerboseLogMaxRounds === undefined) delete process.env[VERBOSE_LOG_MAX_ROUNDS_ENV]
+  else process.env[VERBOSE_LOG_MAX_ROUNDS_ENV] = originalVerboseLogMaxRounds
   if (originalSkipCatalog === undefined) delete process.env[skipCatalogEnv]
   else process.env[skipCatalogEnv] = originalSkipCatalog
+  if (activeResponseIDCacheRoot) rmSync(activeResponseIDCacheRoot, { recursive: true, force: true })
+  activeResponseIDCacheRoot = undefined
+  clearVerboseLogForTesting()
   vi.restoreAllMocks()
 })
+
+function useResponseIDCachePathForTest() {
+  activeResponseIDCacheRoot = mkdtempSync(path.join(os.tmpdir(), "openai-ws-opencode-response-id-cache-"))
+  process.env[RESPONSE_ID_CACHE_PATH_ENV] = path.join(activeResponseIDCacheRoot, "response-ids.json")
+  clearPersistedResponseIDsForTesting()
+}
 
 function writeOpenCodePackageCache(cacheHome: string, cacheName: string, version: string, source = ""): string {
   const entry = path.join(cacheHome, "opencode", "packages", cacheName)
@@ -781,6 +809,17 @@ describe("body and headers", () => {
     expect(prepareBody({ stream: true }, false).background).toBe(true)
   })
 
+  test("preserves explicit store=true for websocket and HTTP fallback bodies", () => {
+    expect(prepareBody({ input: "hello", store: true }, false)).toMatchObject({
+      store: true,
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] }],
+    })
+    expect(prepareHttpFallbackBody({ input: "hello", store: true }, false)).toMatchObject({
+      input: "hello",
+      store: true,
+    })
+  })
+
   test("canonicalizes response input items for the websocket endpoint", () => {
     expect(prepareBody({ input: [{ role: "assistant", content: "hi" }] }, true).input).toEqual([
       { type: "message", role: "assistant", content: [{ type: "output_text", text: "hi" }] },
@@ -788,6 +827,163 @@ describe("body and headers", () => {
     expect(prepareBody({ input: [{ type: "message", role: "user", content: [{ type: "text", text: "hi" }] }] }, true).input).toEqual([
       { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
     ])
+  })
+
+  test("derives prompt_cache_key from leading system prompt without hashing user turns", () => {
+    const first = prepareBody(
+      {
+        model: "gpt-5.4-mini",
+        input: [
+          { role: "system", content: "You are a coder." },
+          { role: "user", content: [{ type: "input_text", text: "First user prompt" }] },
+        ],
+        stream: true,
+      },
+      false,
+    )
+    const second = prepareBody(
+      {
+        model: "gpt-5.4-mini",
+        input: [
+          { role: "system", content: "You are a coder." },
+          { role: "user", content: [{ type: "input_text", text: "Different user prompt and history" }] },
+        ],
+        stream: true,
+      },
+      false,
+    )
+    const changedSystem = prepareBody(
+      {
+        model: "gpt-5.4-mini",
+        input: [
+          { role: "system", content: "You are a reviewer." },
+          { role: "user", content: [{ type: "input_text", text: "First user prompt" }] },
+        ],
+        stream: true,
+      },
+      false,
+    )
+    const userOnly = prepareBody(
+      {
+        model: "gpt-5.4-mini",
+        input: [{ role: "user", content: [{ type: "input_text", text: "User only prompt" }] }],
+        stream: true,
+      },
+      false,
+    )
+
+    expect(first.prompt_cache_key).toBe(second.prompt_cache_key)
+    expect(first.prompt_cache_key).not.toBe(changedSystem.prompt_cache_key)
+    expect(userOnly.prompt_cache_key).toBeUndefined()
+  })
+
+  test("prefers explicit stablePrefixHash over auto-derived instructions hash", () => {
+    const body = prepareBody(
+      {
+        model: "gpt-5.4-mini",
+        instructions: "same prefix",
+        input: "hi",
+        stream: true,
+      },
+      false,
+      { stablePrefixHash: "prefix_live" },
+    )
+
+    expect(body.prompt_cache_key).toBe("prefix_live")
+  })
+
+  test("ignores transient metadata when hashing leading stable prompt messages", () => {
+    const first = prepareBody(
+      {
+        model: "gpt-5.4-mini",
+        input: [
+          {
+            role: "system",
+            id: "msg_1",
+            annotations: ["first"],
+            content: [{ type: "input_text", text: "You are a coder." }],
+          },
+          { role: "user", content: [{ type: "input_text", text: "First user prompt" }] },
+        ],
+        stream: true,
+      },
+      false,
+    )
+    const second = prepareBody(
+      {
+        model: "gpt-5.4-mini",
+        input: [
+          {
+            role: "system",
+            id: "msg_2",
+            annotations: ["second"],
+            metadata: { requestID: "req_2" },
+            content: [{ type: "input_text", text: "You are a coder." }],
+          },
+          { role: "user", content: [{ type: "input_text", text: "Different user prompt" }] },
+        ],
+        stream: true,
+      },
+      false,
+    )
+
+    expect(first.prompt_cache_key).toBe(second.prompt_cache_key)
+  })
+
+  test("treats implicit and explicit default instructions the same for leading system prompts", () => {
+    const implicitDefault = prepareBody(
+      {
+        model: "gpt-5.4-mini",
+        input: [
+          { role: "system", content: "You are a coder." },
+          { role: "user", content: [{ type: "input_text", text: "First user prompt" }] },
+        ],
+        stream: true,
+      },
+      false,
+    )
+    const explicitDefault = prepareBody(
+      {
+        model: "gpt-5.4-mini",
+        instructions: "You are a helpful assistant.",
+        input: [
+          { role: "system", content: "You are a coder." },
+          { role: "user", content: [{ type: "input_text", text: "First user prompt" }] },
+        ],
+        stream: true,
+      },
+      false,
+    )
+
+    expect(implicitDefault.prompt_cache_key).toBe(explicitDefault.prompt_cache_key)
+  })
+
+  test("treats implicit and explicit default instructions the same for leading developer prompts", () => {
+    const implicitDefault = prepareBody(
+      {
+        model: "gpt-5.4-mini",
+        input: [
+          { type: "message", role: "developer", content: "You are a coder." },
+          { type: "message", role: "user", content: [{ type: "input_text", text: "First user prompt" }] },
+        ],
+        stream: true,
+      },
+      false,
+    )
+    const explicitDefault = prepareBody(
+      {
+        model: "gpt-5.4-mini",
+        instructions: "You are a helpful assistant.",
+        input: [
+          { type: "message", role: "developer", content: "You are a coder." },
+          { type: "message", role: "user", content: [{ type: "input_text", text: "First user prompt" }] },
+        ],
+        stream: true,
+      },
+      false,
+    )
+
+    expect(implicitDefault.prompt_cache_key).toBe(explicitDefault.prompt_cache_key)
   })
 
   test("builds required API key and OAuth websocket headers", () => {
@@ -877,6 +1073,38 @@ describe("body and headers", () => {
 
   test("normalizes setup shebang to a single header", () => {
     expect(normalizeSetupShebang("#!/usr/bin/env node\n#!/usr/bin/env node\n\nconsole.log('x')\n")).toBe("#!/usr/bin/env node\nconsole.log('x')\n")
+  })
+})
+
+describe("debug logging", () => {
+  test("defaults verbose logging to enabled unless explicitly disabled", () => {
+    delete process.env[VERBOSE_LOG_ENV]
+    clearVerboseLogForTesting()
+    appendVerboseLogForTesting("[openai-ws] default verbose log")
+    expect(readVerboseLogForTesting()).toContain("default verbose log")
+
+    process.env[VERBOSE_LOG_ENV] = "0"
+    clearVerboseLogForTesting()
+    appendVerboseLogForTesting("[openai-ws] should stay silent")
+    expect(readVerboseLogForTesting()).toBe("")
+  })
+
+  test("retains only the latest ten logged build rounds", () => {
+    delete process.env[VERBOSE_LOG_ENV]
+    delete process.env[VERBOSE_LOG_MAX_ROUNDS_ENV]
+    clearVerboseLogForTesting()
+
+    for (let index = 0; index < 12; index++) {
+      appendVerboseLogForTesting(`[kv-debug] round-start session=sess_${index} model=gpt-5.4`)
+      appendVerboseLogForTesting(`[kv-debug] request conn=ws-${index} session=sess_${index} agent=build model=gpt-5.4 input_hash=${index}`)
+    }
+
+    const log = readVerboseLogForTesting()
+    expect((log.match(/\[kv-debug\] round-start/g) ?? []).length).toBe(10)
+    expect(log).not.toContain("session=sess_0 model=")
+    expect(log).not.toContain("session=sess_1 model=")
+    expect(log).toContain("session=sess_2 model=")
+    expect(log).toContain("session=sess_11 model=")
   })
 })
 
@@ -1595,6 +1823,124 @@ describe("websocket bridge", () => {
     while (!(await secondReader.read()).done) {}
   })
 
+  test("reconnects with a stable prompt_cache_key derived from the leading system prompt", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+    const systemInput = [
+      { role: "system", content: "You are a coder." },
+      { role: "user", content: [{ type: "input_text", text: "hi" }] },
+    ]
+    const continuationInput = [
+      { role: "system", content: "You are a coder." },
+      { role: "user", content: [{ type: "input_text", text: "again" }] },
+    ]
+
+    const first = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.4-mini", input: systemInput, stream: true },
+      false,
+      { sessionID: "sess_reconnect", agent: "review" },
+    )
+    const firstWs = MockWebSocket.instances[0]
+    firstWs.open()
+    const firstFrame = sentFrames(firstWs)[0]
+    firstWs.serverMessage({ type: "response.completed", response: { id: "resp_reconnect_1" } })
+    const firstReader = first.body!.getReader()
+    while (!(await firstReader.read()).done) {}
+    firstWs.close()
+
+    const second = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.4-mini", input: continuationInput, stream: true },
+      false,
+      { sessionID: "sess_reconnect", agent: "review" },
+    )
+    expect(MockWebSocket.instances).toHaveLength(2)
+    const secondWs = MockWebSocket.instances[1]
+    secondWs.open()
+    const secondFrame = sentFrames(secondWs)[0]
+
+    expect(firstFrame.prompt_cache_key).toBeDefined()
+    expect(secondFrame).toMatchObject({
+      type: "response.create",
+      previous_response_id: "resp_reconnect_1",
+      prompt_cache_key: firstFrame.prompt_cache_key,
+    })
+
+    secondWs.serverMessage({ type: "response.completed", response: { id: "resp_reconnect_2" } })
+    const secondReader = second.body!.getReader()
+    while (!(await secondReader.read()).done) {}
+  })
+
+  test("loads previous_response_id from persisted cache after pool reset", async () => {
+    useResponseIDCachePathForTest()
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+
+    const first = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.4-mini", input: "first", stream: true },
+      false,
+      { sessionID: "sess_persisted" },
+    )
+    const firstWs = MockWebSocket.instances[0]
+    firstWs.open()
+    firstWs.serverMessage({ type: "response.completed", response: { id: "resp_persisted_1" } })
+    await readAll(first)
+
+    resetPoolForTesting()
+    MockWebSocket.instances = []
+
+    const second = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.4-mini", input: "again", stream: true },
+      false,
+      { sessionID: "sess_persisted" },
+    )
+    const secondWs = MockWebSocket.instances[0]
+    secondWs.open()
+    expect(sentFrames(secondWs)[0]).toMatchObject({
+      type: "response.create",
+      previous_response_id: "resp_persisted_1",
+    })
+    secondWs.serverMessage({ type: "response.completed", response: { id: "resp_persisted_2" } })
+    await readAll(second)
+  })
+
+  test("persists only the latest ten response-id contexts", async () => {
+    useResponseIDCachePathForTest()
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+
+    for (let index = 0; index < 12; index++) {
+      const response = bridgeWebSocket(
+        "wss://example.test/responses",
+        apiKeyWebSocketHeaders("api-key-test"),
+        { model: "gpt-5.4-mini", input: `turn-${index}`, stream: true },
+        false,
+        { sessionID: `sess_trim_${index}` },
+      )
+      const ws = MockWebSocket.instances[index]
+      ws.open()
+      ws.serverMessage({ type: "response.completed", response: { id: `resp_trim_${index}` } })
+      await readAll(response)
+    }
+
+    const persisted = JSON.parse(readFileSync(process.env[RESPONSE_ID_CACHE_PATH_ENV]!, "utf8")) as Record<
+      string,
+      { response_id: string; updated_at: number }
+    >
+    const keys = Object.keys(persisted)
+    expect(keys).toHaveLength(10)
+    expect(keys.some((key) => key.includes("::session:sess_trim_0::"))).toBe(false)
+    expect(keys.some((key) => key.includes("::session:sess_trim_1::"))).toBe(false)
+    expect(keys.some((key) => key.includes("::session:sess_trim_11::"))).toBe(true)
+    const latestKey = keys.find((key) => key.includes("::session:sess_trim_11::"))
+    expect(latestKey).toBeDefined()
+    expect(persisted[latestKey!]?.response_id).toBe("resp_trim_11")
+  })
+
   test("preserves explicit previous_response_id when supplied by the caller", async () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const response = bridgeWebSocket(
@@ -2146,6 +2492,70 @@ describe("websocket bridge", () => {
     expect(JSON.parse(nextWs.sent[0])).not.toHaveProperty("previous_response_id")
     nextWs.serverMessage({ type: "response.completed", response: { id: "resp_next" } })
     await readAll(next)
+  })
+
+  test("clears persisted previous_response_id after previous_response_not_found across pool reset", async () => {
+    useResponseIDCachePathForTest()
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+
+    const first = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.4-mini", input: "first", stream: true },
+      false,
+      { sessionID: "sess_persisted_missing" },
+    )
+    const firstWs = MockWebSocket.instances[0]
+    firstWs.open()
+    firstWs.serverMessage({ type: "response.completed", response: { id: "resp_missing_persisted" } })
+    await readAll(first)
+
+    resetPoolForTesting()
+    MockWebSocket.instances = []
+
+    const second = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      {
+        model: "gpt-5.4-mini",
+        input: [
+          { type: "function_call_output", call_id: "call_1", output: "tool result" },
+          { type: "message", role: "user", content: "continue" },
+        ],
+        stream: true,
+      },
+      false,
+      { sessionID: "sess_persisted_missing" },
+    )
+    const secondReader = second.body!.getReader()
+    const secondWs = MockWebSocket.instances[0]
+    secondWs.open()
+    expect(sentFrames(secondWs)[0]).toMatchObject({
+      type: "response.create",
+      previous_response_id: "resp_missing_persisted",
+    })
+    secondWs.serverMessage({
+      type: "error",
+      status: 400,
+      error: { code: "previous_response_not_found", message: "Previous response not found" },
+    })
+    await expectNextReadRejects(secondReader, /cannot safely retry without previous_response_id/)
+
+    resetPoolForTesting()
+    MockWebSocket.instances = []
+
+    const third = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.4-mini", input: "next", stream: true },
+      false,
+      { sessionID: "sess_persisted_missing" },
+    )
+    const thirdWs = MockWebSocket.instances[0]
+    thirdWs.open()
+    expect(sentFrames(thirdWs)[0]).not.toHaveProperty("previous_response_id")
+    thirdWs.serverMessage({ type: "response.completed", response: { id: "resp_fresh_after_clear" } })
+    await readAll(third)
   })
 
   test("rejects unexpected binary websocket events", async () => {

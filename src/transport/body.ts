@@ -6,22 +6,9 @@ import {
   X_OPENAI_SUBAGENT_HEADER,
 } from "../constants.js"
 import crypto from "node:crypto"
+import { wsLog } from "../log.js"
 import type { TransportContext } from "./headers.js"
-import fs from "node:fs"
-import os from "node:os"
-import path from "node:path"
-
-const LOG_FILE = path.join(os.tmpdir(), "openai-ws-opencode.log")
-function verboseLogEnabled() {
-  return process.env.OPENAI_WS_OPENCODE_VERBOSE_LOG === "1"
-}
-
-function wsLog(msg: string) {
-  if (!verboseLogEnabled()) return
-  try {
-    fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`)
-  } catch {}
-}
+const DEFAULT_INSTRUCTIONS = "You are a helpful assistant."
 
 function mergeClientMetadata(requestBody: Record<string, unknown>, context: TransportContext): Record<string, string> | undefined {
   const existing = requestBody.client_metadata
@@ -94,21 +81,47 @@ function promptCacheHash(value: unknown): string {
   return crypto.createHash("sha256").update(stableJson(value)).digest("hex").slice(0, 32)
 }
 
-function developerPrefixSeed(requestBody: Record<string, unknown>): Record<string, unknown> | undefined {
-  if (!Array.isArray(requestBody.input) || requestBody.input.length === 0) return undefined
-  const first = requestBody.input[0]
-  if (!first || typeof first !== "object" || Array.isArray(first)) return undefined
-  const firstMessage = first as Record<string, unknown>
-  if (firstMessage.type !== "message" || firstMessage.role !== "developer") return undefined
+function canonicalPromptMessage(message: Record<string, unknown>): Record<string, unknown> {
+  const role = message.role
+  const content = normalizeMessageContent(message.content, role)
+  return {
+    role,
+    ...(typeof message.name === "string" ? { name: message.name } : {}),
+    content,
+  }
+}
+
+function leadingStablePromptMessages(input: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(input) || input.length === 0) return []
+  const messages: Array<Record<string, unknown>> = []
+  for (const item of input) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) break
+    const value = item as Record<string, unknown>
+    if (value.type !== "message") break
+    if (value.role !== "developer" && value.role !== "system") break
+    messages.push(canonicalPromptMessage(value))
+  }
+  return messages
+}
+
+function normalizedInstructions(requestBody: Record<string, unknown>): string | undefined {
+  return typeof requestBody.instructions === "string" && requestBody.instructions !== "" ? requestBody.instructions : undefined
+}
+
+function stablePromptSeed(requestBody: Record<string, unknown>, instructions: string | undefined): Record<string, unknown> | undefined {
+  const promptMessages = leadingStablePromptMessages(requestBody.input)
+  const hasPromptMessages = promptMessages.length > 0
+  const hasInstructionsOnlyPrefix = instructions !== undefined && instructions !== DEFAULT_INSTRUCTIONS
+  if (!hasPromptMessages && !hasInstructionsOnlyPrefix) return undefined
   return {
     model: requestBody.model ?? null,
-    instructions: requestBody.instructions ?? null,
+    instructions: instructions ?? null,
     include: requestBody.include ?? null,
     reasoning: requestBody.reasoning ?? null,
     text: requestBody.text ?? null,
     tool_choice: requestBody.tool_choice ?? null,
     tools: requestBody.tools ?? null,
-    first_message: firstMessage,
+    prompt_messages: promptMessages,
   }
 }
 
@@ -119,7 +132,7 @@ export function prepareBody(
 ): Record<string, unknown> {
   const { stream_options: _streamOptions, ...wsBody } = requestBody
 
-  if (!wsBody.instructions) wsBody.instructions = "You are a helpful assistant."
+  if (!wsBody.instructions) wsBody.instructions = DEFAULT_INSTRUCTIONS
   if (wsBody.input !== undefined) wsBody.input = normalizeInput(wsBody.input)
   if (wsBody.store === undefined) wsBody.store = false
   if (wsBody.stream === undefined) wsBody.stream = true
@@ -131,9 +144,12 @@ export function prepareBody(
     delete wsBody.max_tokens
   }
   if (wsBody.prompt_cache_key === undefined) {
-    const seed = developerPrefixSeed(wsBody)
-    if (seed) wsBody.prompt_cache_key = promptCacheHash(seed)
-    else if (context.stablePrefixHash) wsBody.prompt_cache_key = context.stablePrefixHash
+    if (context.stablePrefixHash) {
+      wsBody.prompt_cache_key = context.stablePrefixHash
+    } else {
+      const seed = stablePromptSeed(wsBody, normalizedInstructions(wsBody))
+      if (seed) wsBody.prompt_cache_key = promptCacheHash(seed)
+    }
   }
   const clientMetadata = mergeClientMetadata(wsBody, context)
   if (clientMetadata) wsBody.client_metadata = clientMetadata

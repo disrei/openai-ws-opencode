@@ -1,7 +1,4 @@
 import type { Hooks, Plugin } from "@opencode-ai/plugin"
-import fs from "node:fs"
-import os from "node:os"
-import path from "node:path"
 import {
   CODEX_API_BASE,
   CODEX_API_ENDPOINT,
@@ -16,6 +13,7 @@ import {
 } from "./constants.js"
 import { oauthMethods } from "./auth/oauth.js"
 import { extractAccountId, refreshAccessToken, tokenExpiry, type StoredOAuthAuth } from "./auth/tokens.js"
+import { wsLog } from "./log.js"
 import { fetchCodexCatalog, fetchOpenAIModelIds } from "./models/catalog.js"
 import { CODEX_EFFECTIVE_CONTEXT_WINDOW, CODEX_OUTPUT_TOKEN_LIMIT, OPENAI_WS_MODELS } from "./models/defaults.js"
 import { resolveModelsForApiKey, resolveModelsForOAuth } from "./models/resolve.js"
@@ -23,18 +21,6 @@ import { prepareHttpFallbackBody } from "./transport/body.js"
 import { bridgeWebSocket } from "./transport/bridge.js"
 import { closeConnections, ensureWarmConnection, invalidateStaleAuthConnections } from "./transport/pool.js"
 import { extractTransportContext, httpAuthHeaders, transportIdentity, customProviderTransportIdentity } from "./transport/headers.js"
-
-const LOG_FILE = path.join(os.tmpdir(), "openai-ws-opencode.log")
-function verboseLogEnabled() {
-  return process.env.OPENAI_WS_OPENCODE_VERBOSE_LOG === "1"
-}
-
-function wsLog(msg: string) {
-  if (!verboseLogEnabled()) return
-  try {
-    fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`)
-  } catch {}
-}
 
 const providerModelRefreshVersion = new WeakMap<object, number>()
 

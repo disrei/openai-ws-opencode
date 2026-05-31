@@ -2042,7 +2042,7 @@ describe("websocket bridge", () => {
     await readAll(response)
   })
 
-  test("sends hook-mutated full context with persisted continuation state", async () => {
+  test("does not auto-chain previous_response_id when input already includes multi-message context", async () => {
     setWebSocketConstructorForTesting(MockWebSocket as any)
     const first = bridgeWebSocket(
       "wss://example.test/responses",
@@ -2072,8 +2072,8 @@ describe("websocket bridge", () => {
     expect(frame).toMatchObject({
       type: "response.create",
       input: fullContextInput,
-      previous_response_id: "resp_first",
     })
+    expect(frame).not.toHaveProperty("previous_response_id")
     ws.serverMessage({ type: "response.completed", response: { id: "resp_second" } })
     await readAll(second)
   })
@@ -3348,13 +3348,13 @@ describe("websocket bridge", () => {
       expect(createBodies[1]).toMatchObject({
         type: "response.create",
         input: replacementInput,
-        previous_response_id: "resp_interrupted_seed",
         prompt_cache_key: "prefix_after",
         client_metadata: {
           "x-codex-window-id": "sess_live_mutation",
           "x-openai-subagent": "review",
         },
       })
+      expect(createBodies[1]).not.toHaveProperty("previous_response_id")
       expect(secondText).toContain("response.completed")
     } finally {
       resetPoolForTesting()

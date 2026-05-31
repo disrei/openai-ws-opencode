@@ -846,6 +846,17 @@ function hasReplaySafeInput(body: Record<string, unknown>): boolean {
   })
 }
 
+function shouldAutoAttachPreviousResponseID(input: unknown): boolean {
+  if (typeof input === "string") return input.length > 0
+  if (!Array.isArray(input) || input.length === 0) return false
+
+  const conversationMessages = leadingConversationMessages(input)
+  if (conversationMessages.some((message) => message.role === "assistant")) return false
+  if (conversationMessages.length > 1) return false
+
+  return true
+}
+
 function clearLastResponseID(conn: PooledConnection) {
   loadPersistedResponseIDs()
   if (conn.lastResponseID === undefined && !lastResponseIDByContext.has(conn.contextKey)) return
@@ -990,7 +1001,7 @@ export function sendPending(conn: PooledConnection): boolean {
     if (shouldResetPreviousResponseForCompactionBoundary(conn, body.input, pending)) {
       clearLastResponseID(conn)
       body.previous_response_id = null
-    } else if (body.previous_response_id === undefined && conn.lastResponseID) {
+    } else if (body.previous_response_id === undefined && conn.lastResponseID && shouldAutoAttachPreviousResponseID(body.input)) {
       body.previous_response_id = conn.lastResponseID
     }
     logRequestForDebug(conn, body)

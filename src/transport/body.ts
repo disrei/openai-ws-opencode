@@ -134,7 +134,7 @@ export function prepareBody(
 
   if (!wsBody.instructions) wsBody.instructions = DEFAULT_INSTRUCTIONS
   if (wsBody.input !== undefined) wsBody.input = normalizeInput(wsBody.input)
-  if (wsBody.store === undefined) wsBody.store = false
+  wsBody.store = false
   if (wsBody.stream === undefined) wsBody.stream = true
   if (wsBody.background === undefined && shouldUseBackgroundResponses()) wsBody.background = true
   delete wsBody.max_output_tokens
@@ -159,6 +159,6 @@ export function prepareBody(
 
 export function prepareHttpFallbackBody(requestBody: Record<string, unknown>, _isOAuth: boolean): Record<string, unknown> {
   const next = { ...requestBody }
-  if (next.store === undefined) next.store = false
+  next.store = false
   return next
 }

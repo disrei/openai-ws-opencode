@@ -19,6 +19,7 @@ import {
   INTERNAL_AGENT_HEADER,
   INTERNAL_MODEL_HEADER,
   INTERNAL_PREFIX_HASH_HEADER,
+  INTERNAL_RESET_PREVIOUS_RESPONSE_HEADER,
   INTERNAL_SESSION_HEADER,
   BACKGROUND_ORCHESTRATION_ENV,
   OPENAI_WS_BETA,
@@ -39,6 +40,7 @@ import {
   clearVerboseLogForTesting,
   clearPersistedResponseIDsForTesting,
   connectionPool,
+  extractTransportContext,
   invalidateStaleAuthConnections,
   oauthTesting,
   oauthWebSocketHeaders,
@@ -1022,6 +1024,71 @@ describe("body and headers", () => {
     expect(output.headers[INTERNAL_PREFIX_HASH_HEADER]).toBeUndefined()
   })
 
+  test("chat.headers marks the next request after compaction to reset previous_response_id once", async () => {
+    const hooks = await plugin({ client: { auth: { set: vi.fn() } } } as any)
+    await hooks.event?.({
+      event: {
+        type: "session.next.compaction.ended",
+        sessionID: "sess_compacted",
+        timestamp: new Date().toISOString(),
+        text: "summary",
+      } as any,
+    })
+
+    const first = { headers: {} as Record<string, string> }
+    await hooks["chat.headers"]?.(
+      {
+        sessionID: "sess_compacted",
+        agent: "primary",
+        model: { providerID: "custom-ws", id: "gpt-5.4" } as any,
+        provider: {} as any,
+        message: { id: "msg_after_compact", parts: [{ type: "text", text: "next user prompt" }] } as any,
+      },
+      first,
+    )
+
+    const second = { headers: {} as Record<string, string> }
+    await hooks["chat.headers"]?.(
+      {
+        sessionID: "sess_compacted",
+        agent: "primary",
+        model: { providerID: "custom-ws", id: "gpt-5.4" } as any,
+        provider: {} as any,
+        message: { id: "msg_normal", parts: [{ type: "text", text: "later prompt" }] } as any,
+      },
+      second,
+    )
+
+    expect(first.headers[INTERNAL_RESET_PREVIOUS_RESPONSE_HEADER]).toBe("1")
+    expect(second.headers[INTERNAL_RESET_PREVIOUS_RESPONSE_HEADER]).toBeUndefined()
+  })
+
+  test("chat.headers marks auto-compaction continue messages to reset previous_response_id", async () => {
+    const hooks = await plugin({ client: { auth: { set: vi.fn() } } } as any)
+    const output = { headers: {} as Record<string, string> }
+    await hooks["chat.headers"]?.(
+      {
+        sessionID: "sess_auto_compact",
+        agent: "primary",
+        model: { providerID: "custom-ws", id: "gpt-5.4" } as any,
+        provider: {} as any,
+        message: {
+          id: "msg_continue",
+          parts: [
+            {
+              type: "text",
+              text: "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
+              metadata: { compaction_continue: true },
+            },
+          ],
+        } as any,
+      },
+      output,
+    )
+
+    expect(output.headers[INTERNAL_RESET_PREVIOUS_RESPONSE_HEADER]).toBe("1")
+  })
+
   test("chat.headers avoids auto prompt_cache_key collisions across different user content", async () => {
     const hooks = await plugin({ client: { auth: { set: vi.fn() } } } as any)
 
@@ -1069,6 +1136,21 @@ describe("body and headers", () => {
 
     expect(first.headers[INTERNAL_PREFIX_HASH_HEADER]).toBeUndefined()
     expect(second.headers[INTERNAL_PREFIX_HASH_HEADER]).toBeUndefined()
+  })
+
+  test("extractTransportContext parses and strips the internal compaction reset header", () => {
+    const headers = {
+      [INTERNAL_SESSION_HEADER]: "sess_1",
+      [INTERNAL_RESET_PREVIOUS_RESPONSE_HEADER]: "1",
+      Authorization: "Bearer api-key-test",
+    }
+    const context = extractTransportContext(headers)
+
+    expect(context.sessionID).toBe("sess_1")
+    expect(context.resetPreviousResponseID).toBe(true)
+    expect(context.forwardHeaders.get(INTERNAL_SESSION_HEADER)).toBeNull()
+    expect(context.forwardHeaders.get(INTERNAL_RESET_PREVIOUS_RESPONSE_HEADER)).toBeNull()
+    expect(context.forwardHeaders.get("Authorization")).toBe("Bearer api-key-test")
   })
 
   test("normalizes setup shebang to a single header", () => {
@@ -3278,6 +3360,121 @@ describe("websocket bridge", () => {
       resetPoolForTesting()
       server.stop(true)
     }
+  })
+
+  test("breaks previous_response_id chain when transport context requests a compaction reset while keeping prompt cache key", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+
+    const first = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
+      false,
+      { sessionID: "sess_compaction_reset", agent: "review", stablePrefixHash: "prefix_compaction_reset" },
+    )
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    ws.serverMessage({ type: "response.completed", response: { id: "resp_before_compaction_reset" } })
+    await readAll(first)
+
+    const second = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.4-mini", input: "after manual compact", stream: true },
+      false,
+      {
+        sessionID: "sess_compaction_reset",
+        agent: "review",
+        stablePrefixHash: "prefix_compaction_reset",
+        resetPreviousResponseID: true,
+      },
+    )
+
+    expect(MockWebSocket.instances).toHaveLength(1)
+    expect(sentFrames(ws)[1]).toMatchObject({
+      type: "response.create",
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "after manual compact" }] }],
+      previous_response_id: null,
+      prompt_cache_key: "prefix_compaction_reset",
+      client_metadata: {
+        "x-codex-window-id": "sess_compaction_reset",
+        "x-openai-subagent": "review",
+      },
+    })
+
+    ws.serverMessage({ type: "response.completed", response: { id: "resp_after_compaction_reset" } })
+    expect(await readAll(second)).toContain("response.completed")
+  })
+
+  test("breaks previous_response_id chain on opencode compaction boundary while keeping prompt cache key", async () => {
+    setWebSocketConstructorForTesting(MockWebSocket as any)
+
+    const first = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.4-mini", input: "hi", stream: true },
+      false,
+      { sessionID: "sess_compaction_boundary", agent: "review", stablePrefixHash: "prefix_compaction" },
+    )
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+    ws.serverMessage({ type: "response.completed", response: { id: "resp_before_compaction" } })
+    await readAll(first)
+
+    const compactionInput = [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "What did we do so far?" }] },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: "Compaction summary." }] },
+      {
+        type: "message",
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
+          },
+        ],
+      },
+    ]
+    const second = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.4-mini", input: compactionInput, stream: true },
+      false,
+      { sessionID: "sess_compaction_boundary", agent: "review", stablePrefixHash: "prefix_compaction" },
+    )
+
+    expect(MockWebSocket.instances).toHaveLength(1)
+    expect(sentFrames(ws)[1]).toMatchObject({
+      type: "response.create",
+      input: compactionInput,
+      previous_response_id: null,
+      prompt_cache_key: "prefix_compaction",
+      client_metadata: {
+        "x-codex-window-id": "sess_compaction_boundary",
+        "x-openai-subagent": "review",
+      },
+    })
+
+    ws.serverMessage({ type: "response.completed", response: { id: "resp_after_compaction" } })
+    expect(await readAll(second)).toContain("response.completed")
+
+    const third = bridgeWebSocket(
+      "wss://example.test/responses",
+      apiKeyWebSocketHeaders("api-key-test"),
+      { model: "gpt-5.4-mini", input: "post-compaction follow-up", stream: true },
+      false,
+      { sessionID: "sess_compaction_boundary", agent: "review", stablePrefixHash: "prefix_compaction" },
+    )
+
+    expect(sentFrames(ws)[2]).toMatchObject({
+      type: "response.create",
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "post-compaction follow-up" }] }],
+      previous_response_id: "resp_after_compaction",
+      prompt_cache_key: "prefix_compaction",
+    })
+
+    ws.serverMessage({ type: "response.completed", response: { id: "resp_post_compaction_follow_up" } })
+    expect(await readAll(third)).toContain("response.completed")
   })
 
   test("live websocket automatically reuses response id captured before cancel", async () => {

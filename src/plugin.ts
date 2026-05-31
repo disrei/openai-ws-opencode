@@ -4,6 +4,7 @@ import {
   CODEX_API_ENDPOINT,
   INTERNAL_AGENT_HEADER,
   INTERNAL_MODEL_HEADER,
+  INTERNAL_RESET_PREVIOUS_RESPONSE_HEADER,
   INTERNAL_SESSION_HEADER,
   OPENAI_API_BASE,
   OPENAI_WS_URL,
@@ -52,6 +53,17 @@ const DEFAULT_BUNDLED_LIMIT = {
   context: CODEX_EFFECTIVE_CONTEXT_WINDOW,
   input: CODEX_EFFECTIVE_CONTEXT_WINDOW,
   output: CODEX_OUTPUT_TOKEN_LIMIT,
+}
+
+function shouldResetPreviousResponseForMessage(message: unknown): boolean {
+  if (!message || typeof message !== "object" || Array.isArray(message)) return false
+  const parts = (message as { parts?: unknown }).parts
+  if (!Array.isArray(parts)) return false
+  return parts.some((part) => {
+    if (!part || typeof part !== "object" || Array.isArray(part)) return false
+    const value = part as { type?: unknown; metadata?: Record<string, unknown> }
+    return value.type === "text" && value.metadata?.compaction_continue === true
+  })
 }
 
 function bundledLimitFor(modelID: unknown): { context: number; input?: number; output: number } {
@@ -122,6 +134,7 @@ function extractApiKeyFromOptions(provider: any): string | undefined {
 
 const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
   wsLog("=== Plugin initialized ===")
+  const pendingPreviousResponseResetSessions = new Set<string>()
   const hooks: Hooks = {
     "chat.headers": async (input, output) => {
       if (input.model.providerID !== CUSTOM_PROVIDER_ID) return
@@ -130,6 +143,9 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
       headers[INTERNAL_AGENT_HEADER] = input.agent
       const modelID = input.model.id ?? (input.model as any).modelID
       headers[INTERNAL_MODEL_HEADER] = modelID
+      if (pendingPreviousResponseResetSessions.delete(input.sessionID) || shouldResetPreviousResponseForMessage(input.message)) {
+        headers[INTERNAL_RESET_PREVIOUS_RESPONSE_HEADER] = "1"
+      }
     },
 
     "chat.params": async (input, _output) => {
@@ -154,11 +170,17 @@ const OpenAIWebSocketPlugin: Plugin = async ({ client }) => {
     event: async ({ event }) => {
       if (event.type === "session.deleted") {
         const deletedSessionID = (event as any).properties?.info?.id
+        if (typeof deletedSessionID === "string") pendingPreviousResponseResetSessions.delete(deletedSessionID)
         closeConnections((conn) => conn.activeSessionID === deletedSessionID || conn.lastSessionID === deletedSessionID)
         return
       }
       const eventType = String(event.type)
+      if (eventType === "session.next.compaction.ended" && typeof (event as any).sessionID === "string") {
+        pendingPreviousResponseResetSessions.add((event as any).sessionID)
+        return
+      }
       if (eventType === "server.instance.disposed" || eventType === "global.disposed") {
+        pendingPreviousResponseResetSessions.clear()
         closeConnections()
       }
     },

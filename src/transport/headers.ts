@@ -4,6 +4,7 @@ import {
   INTERNAL_AGENT_HEADER,
   INTERNAL_MODEL_HEADER,
   INTERNAL_PREFIX_HASH_HEADER,
+  INTERNAL_RESET_PREVIOUS_RESPONSE_HEADER,
   INTERNAL_SESSION_HEADER,
   OPENAI_WS_BETA,
   OPENAI_WS_URL,
@@ -16,6 +17,7 @@ export type TransportContext = {
   agent?: string
   modelID?: string
   stablePrefixHash?: string
+  resetPreviousResponseID?: boolean
 }
 
 function defaultHeaders(): Record<string, string> {
@@ -88,13 +90,17 @@ export function extractTransportContext(input?: HeadersInit): TransportContext &
   const agent = forwardHeaders.get(INTERNAL_AGENT_HEADER) ?? undefined
   const modelID = forwardHeaders.get(INTERNAL_MODEL_HEADER) ?? undefined
   const stablePrefixHash = forwardHeaders.get(INTERNAL_PREFIX_HASH_HEADER) ?? undefined
+  const resetPreviousResponseIDHeader = forwardHeaders.get(INTERNAL_RESET_PREVIOUS_RESPONSE_HEADER)
+  const resetPreviousResponseID =
+    resetPreviousResponseIDHeader === "1" || resetPreviousResponseIDHeader?.toLowerCase() === "true"
 
   forwardHeaders.delete(INTERNAL_SESSION_HEADER)
   forwardHeaders.delete(INTERNAL_AGENT_HEADER)
   forwardHeaders.delete(INTERNAL_MODEL_HEADER)
   forwardHeaders.delete(INTERNAL_PREFIX_HASH_HEADER)
+  forwardHeaders.delete(INTERNAL_RESET_PREVIOUS_RESPONSE_HEADER)
 
-  return { sessionID, agent, modelID, stablePrefixHash, forwardHeaders }
+  return { sessionID, agent, modelID, stablePrefixHash, resetPreviousResponseID, forwardHeaders }
 }
 
 export function customProviderWebSocketHeaders(apiKey: string, customHeaders?: Record<string, string>): Record<string, string> {

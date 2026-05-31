@@ -181,7 +181,7 @@ export function bridgeWebSocket(
       processedAckSent: false,
       previousResponseNotFoundRetried: false,
       idleTimer: null,
-      metadata: {},
+      metadata: { resetPreviousResponseID: context.resetPreviousResponseID === true },
       onError: (error, pending) => tryStartFallback(error, pending),
     }
     sendPending(conn)

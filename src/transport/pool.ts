@@ -24,10 +24,12 @@ import type { TransportContext } from "./headers.js"
 let WebSocketImpl: WebSocketConstructor = loadDefaultWebSocketConstructor()
 const RESPONSE_ID_CACHE_FILE = "response-ids.json"
 const MAX_PERSISTED_RESPONSE_IDS = 10
+const COMPACTION_SUMMARY_PROMPT = "What did we do so far?"
 
 type PendingMetadata = {
   responseId?: string
   activeResponseId?: string
+  resetPreviousResponseID?: boolean
 }
 
 export interface PendingRequest {
@@ -111,6 +113,7 @@ const acquisitionQueues = new Map<string, QueueEntry[]>()
 const turnStateByContext = new Map<string, string>()
 const lastResponseIDByContext = new Map<string, string>()
 const lastResponseIDUpdatedAtByContext = new Map<string, number>()
+const lastCompactionFingerprintByContext = new Map<string, string>()
 const lastDeveloperPromptHashByContext = new Map<string, string>()
 let persistedResponseIDsLoaded = false
 let persistedResponseIDCachePath: string | undefined
@@ -397,6 +400,72 @@ function logFrameForDebug(conn: PooledConnection, frame: Record<string, unknown>
 
 function scopeKey(wsUrl: string, headers: Record<string, string>): string {
   return `${wsUrl}::${authScopeHash(headers)}`
+}
+
+function contentPartText(part: unknown): string | undefined {
+  if (!part || typeof part !== "object" || Array.isArray(part)) return undefined
+  const value = part as Record<string, unknown>
+  if (typeof value.text === "string") return value.text
+  if (typeof value.input_text === "string") return value.input_text
+  if (typeof value.output_text === "string") return value.output_text
+  return undefined
+}
+
+function messageContainsText(message: Record<string, unknown>, expected: string): boolean {
+  const content = message.content
+  if (typeof content === "string") return content.includes(expected)
+  if (!Array.isArray(content)) return false
+  return content.some((part) => contentPartText(part)?.includes(expected))
+}
+
+function isMessageWithRole(item: unknown, role: "user" | "assistant" | "developer" | "system"): item is Record<string, unknown> {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return false
+  const value = item as Record<string, unknown>
+  return (value.type ?? "message") === "message" && value.role === role
+}
+
+function leadingConversationMessages(input: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(input)) return []
+  const messages: Record<string, unknown>[] = []
+  for (const item of input) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) break
+    const value = item as Record<string, unknown>
+    if ((value.type ?? "message") !== "message") break
+    if (value.role === "developer" || value.role === "system") continue
+    messages.push(value)
+  }
+  return messages
+}
+
+function compactionBoundaryFingerprint(input: unknown): string | undefined {
+  const messages = leadingConversationMessages(input)
+  if (
+    !(
+      messages.length >= 2 &&
+      isMessageWithRole(messages[0], "user") &&
+      messageContainsText(messages[0], COMPACTION_SUMMARY_PROMPT) &&
+      isMessageWithRole(messages[1], "assistant")
+    )
+  ) {
+    return undefined
+  }
+  return crypto.createHash("sha256").update(JSON.stringify(messages.slice(0, 2))).digest("hex")
+}
+
+function shouldResetPreviousResponseForCompactionBoundary(
+  conn: PooledConnection,
+  input: unknown,
+  pending: PendingRequest,
+): boolean {
+  const fingerprint = compactionBoundaryFingerprint(input)
+  if (pending.metadata.resetPreviousResponseID === true) {
+    if (fingerprint) lastCompactionFingerprintByContext.set(conn.contextKey, fingerprint)
+    return true
+  }
+  if (!fingerprint) return false
+  if (lastCompactionFingerprintByContext.get(conn.contextKey) === fingerprint) return false
+  lastCompactionFingerprintByContext.set(conn.contextKey, fingerprint)
+  return true
 }
 
 function contextScopeKey(wsUrl: string, headers: Record<string, string>, context: TransportContext): string {
@@ -918,7 +987,12 @@ export function sendPending(conn: PooledConnection): boolean {
   const generation = conn.generation
   try {
     const body = { ...pending.body }
-    if (body.previous_response_id === undefined && conn.lastResponseID) body.previous_response_id = conn.lastResponseID
+    if (shouldResetPreviousResponseForCompactionBoundary(conn, body.input, pending)) {
+      clearLastResponseID(conn)
+      body.previous_response_id = null
+    } else if (body.previous_response_id === undefined && conn.lastResponseID) {
+      body.previous_response_id = conn.lastResponseID
+    }
     logRequestForDebug(conn, body)
     const payload = JSON.stringify({ ...body, type: "response.create" })
     pending.sent = true
@@ -1334,6 +1408,7 @@ export function resetPoolForTesting() {
   }
   acquisitionQueues.clear()
   turnStateByContext.clear()
+  lastCompactionFingerprintByContext.clear()
   resetPersistedResponseIDState()
 }
 
